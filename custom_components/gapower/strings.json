@@ -1,0 +1,46 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "description": "Sign in with your Georgia Power (southerncompany.com) account. Credentials are stored in Home Assistant and used only to read your own usage data.",
+        "data": {
+          "username": "Username",
+          "password": "Password"
+        }
+      },
+      "reauth_confirm": {
+        "description": "Georgia Power rejected the stored credentials. Re-enter them to continue.",
+        "data": {
+          "username": "Username",
+          "password": "Password"
+        }
+      }
+    },
+    "error": {
+      "invalid_auth": "Invalid username or password.",
+      "cannot_connect": "Could not reach Southern Company. Try again shortly.",
+      "bot_detected": "Southern Company's bot protection blocked the request. This usually clears within about 30 minutes - try again then.",
+      "unknown": "Unexpected error. Check the logs for details."
+    },
+    "abort": {
+      "already_configured": "This Georgia Power account is already set up.",
+      "reauth_successful": "Re-authentication was successful."
+    }
+  },
+  "entity": {
+    "sensor": {
+      "last_reading": {
+        "name": "Last reading"
+      },
+      "latest_hour_usage": {
+        "name": "Latest hour usage"
+      },
+      "latest_hour_cost": {
+        "name": "Latest hour cost"
+      },
+      "imported_rows": {
+        "name": "Rows imported"
+      }
+    }
+  }
+}
