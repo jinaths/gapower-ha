@@ -71,6 +71,14 @@ IMPERVA_MARKERS_WEAK = ("incident id", "robot")
 # Only meaningful when the expected field is ALSO missing; checked at the call site.
 LOADING_SHELL = "<title>loading</title>"
 
+# During a planned outage Southern Company parks EVERY customerservice2 route here -
+# including unauthenticated ones. Verified 2026-09-07 during the Aug 31 - Sep 8 2026
+# CIS migration: /Billing/Home and customerservice2api both 302 to this host with no
+# session at all. So a redirect here is never a credential, token, or WAF problem, and
+# must not be reported as one - the old code surfaced it as the very misleading
+# "login step 3: SouthernJwtCookie missing".
+MAINTENANCE_HOST = "friendly-error.southernco.com"
+
 
 class GaPowerError(Exception):
     """Base error."""
@@ -86,6 +94,10 @@ class GaPowerBotDetected(GaPowerError):
 
 class GaPowerTransient(GaPowerError):
     """Network blip, 5xx, or 429. Safe to retry later."""
+
+
+class GaPowerMaintenance(GaPowerError):
+    """Utility-side planned outage. Nothing to fix here; resolves on its own."""
 
 
 def _looks_like_bot_challenge(status: int, body: str, content_type: str) -> bool:
@@ -132,12 +144,22 @@ class GaPowerApi:
                     ctype = resp.headers.get("Content-Type", "")
                     raw_headers = {
                         "Set-Cookie": resp.headers.getall("Set-Cookie", []),
+                        "Location": resp.headers.get("Location", ""),
                     }
             except (aiohttp.ClientError, asyncio.TimeoutError) as err:
                 last = err
                 if attempt == MAX_RETRIES:
                     raise GaPowerTransient(f"{type(err).__name__}: {err}") from err
             else:
+                # Checked before everything else: during an outage this fires on the
+                # login relay AND on the data API, so one choke point covers both.
+                if MAINTENANCE_HOST in raw_headers["Location"]:
+                    raise GaPowerMaintenance(
+                        f"{url.split('?')[0]} redirects to {MAINTENANCE_HOST} - "
+                        "Southern Company's portal is in a planned outage. "
+                        "Credentials are fine; this clears when they restore service "
+                        "and the next poll backfills the gap."
+                    )
                 if _looks_like_bot_challenge(status, body, ctype):
                     raise GaPowerBotDetected(
                         f"WAF challenge from {url.split('?')[0]} (HTTP {status})"
