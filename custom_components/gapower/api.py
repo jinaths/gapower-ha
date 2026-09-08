@@ -1,20 +1,30 @@
 """Southern Company / Georgia Power web API client.
 
-Async (aiohttp) port of the auth chain from apearson/southern-company-api
-(src/main.ts:50-196) - the 2024 "SPA endpoints" flow. Deliberately NOT built on the
-`southern-company-api` PyPI package, whose first hop still uses the older
-GET-and-scrape-`data-aft` pattern that upstream JS replaced.
+Rewritten 2026-09-08 for the Aug 31 - Sep 8 2026 CIS migration, which replaced the
+authentication system outright rather than adjusting it. Mapped from a browser HAR of
+a real manual login; see README "2026-09 Southern Company migration".
 
-Endpoint quirks that are load-bearing - do not "clean these up":
+What the migration changed:
 
-* `EndDate` on MPUData is EXCLUSIVE. StartDate == EndDate returns an empty range and
-  reports HasData=false. Always pass (last wanted day + 1).
+* Credentials now go to ForgeRock/PingAM at customerlogin.southernco.com, using its
+  `callbacks[]` protocol, not the old flat-JSON `/webservices/api/WebUser/Login`.
+* The portal session is then minted through an OIDC authorization-code exchange with
+  PKCE, replacing the `ScWebToken` hidden-input scrape.
+* The data API moved from customerservice2api `MPUData` to
+  occmypowerusageapi `MyPowerUsage/UsageGraphData`, which needs four opaque
+  identifiers instead of a bare service-point number.
+
+What did NOT change, and is still load-bearing - do not "clean these up":
+
+* `endDate` is EXCLUSIVE. startDate == endDate returns an empty range and reports
+  hasData=false. Always pass (last wanted day + 1).
 * Dates must be plain MM/DD/YYYY. Appending a time component ("11:59:59 PM") makes
   the Hourly route return null even with the correct +1 day.
 * `intervalBehavior` must be "Automatic" (or "Interval"). Counterintuitively "Hourly"
   returns null on the /Hourly route.
 
-All three were verified live 2026-08-06/07.
+The first three were verified live 2026-08-06/07 and re-confirmed against the new
+endpoint in the 2026-09-08 capture.
 """
 
 from __future__ import annotations
@@ -26,6 +36,7 @@ import logging
 import random
 import re
 from typing import Any
+from urllib.parse import urljoin, urlparse
 
 import aiohttp
 
@@ -33,49 +44,67 @@ from .const import CHUNK_DAYS, SENTINEL
 
 _LOGGER = logging.getLogger(__name__)
 
-API = "https://customerservice2api.southerncompany.com/api"
+FORGEROCK = "https://customerlogin.southernco.com"
 WEBAUTH = "https://webauth.southernco.com"
 CS2 = "https://customerservice2.southerncompany.com"
+ACCOUNT_API = "https://occaccountapi.southerncompany.com/api/v1"
+USAGE_API = "https://occmypowerusageapi.southerncompany.com/api/v1"
 
-COMPANY_MAP = {0: "SCS", 1: "APC", 2: "GPC", 4: "MPC", 7: "NICOR_GAS"}
+# ForgeRock realm path and the authentication tree the portal uses.
+AM_AUTH_PATH = "/am/json/realms/root/realms/alpha/authenticate"
+AM_SERVICE = "occSecureLogin"
+
+# ForgeRock rejects the callback protocol without these two. The SDK marker also keeps
+# us on the JSON API rather than AM's own hosted login UI.
+FORGEROCK_HEADERS = {
+    "Accept-API-Version": "protocol=1.0,resource=2.1",
+    "X-Requested-With": "forgerock-sdk",
+    "Accept": "application/json, text/plain, */*",
+}
+
+# Custom headers the portal's own XHRs carry to the occ* services. `devicetype` and
+# `userid` are echoed verbatim from the capture; the services accept the request
+# without the analytics-only `trace-data`, so that one is not reproduced.
+DEVICE_TYPE = "Desktop"
 
 MAX_RETRIES = 3
 BACKOFF_BASE = 2.0
 BACKOFF_CAP = 30.0
 REQUEST_DELAY = 1.0
+MAX_REDIRECTS = 10
 
 UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+    "(KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36"
 )
 BROWSER_HEADERS = {
     "User-Agent": UA,
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
     "Accept-Language": "en-US,en;q=0.9",
-    "Sec-Ch-Ua": '"Chromium";v="126", "Not)A;Brand";v="99", "Google Chrome";v="126"',
+    "Sec-Ch-Ua": '"Chromium";v="152", "Not?A_Brand";v="24", "Google Chrome";v="152"',
     "Sec-Ch-Ua-Mobile": "?0",
     "Sec-Ch-Ua-Platform": '"Windows"',
     "Upgrade-Insecure-Requests": "1",
 }
 
-# Keep this list NARROW. Verified live 2026-08-07: a *successful* /SPA/Navigation
-# response contains "_Incapsula_Resource" and "/_Incapsula_" - those are the Imperva
-# client SDK <script> tags, present on every page whether blocked or not. Same for
-# "reese84". Matching on them blocks perfectly good logins. Only the real block page
-# carries "Request unsuccessful. Incapsula incident ID: ...".
+# Keep this list NARROW. Verified live 2026-08-07: a *successful* portal response
+# contains "_Incapsula_Resource" and "/_Incapsula_" - those are the Imperva client SDK
+# <script> tags, present on every page whether blocked or not. Same for "reese84".
+# Matching on them blocks perfectly good logins. Only the real block page carries
+# "Request unsuccessful. Incapsula incident ID: ...".
 IMPERVA_MARKERS_STRONG = ("incapsula incident", "request unsuccessful")
 IMPERVA_MARKERS_WEAK = ("incident id", "robot")
 
-# Imperva's JS challenge renders a bare "Loading" shell - but so does Southern
-# Company's own /SPA/Navigation step, which legitimately carries the ScWebToken.
-# Only meaningful when the expected field is ALSO missing; checked at the call site.
+# Imperva's JS challenge renders a bare "Loading" shell - but so do several legitimate
+# hops in this relay, which carry their payload in a self-submitting form. Only
+# meaningful when the expected field is ALSO missing; checked at the call site.
 LOADING_SHELL = "<title>loading</title>"
 
 # During a planned outage Southern Company parks EVERY customerservice2 route here -
 # including unauthenticated ones. Verified 2026-09-07 during the Aug 31 - Sep 8 2026
-# CIS migration: /Billing/Home and customerservice2api both 302 to this host with no
-# session at all. So a redirect here is never a credential, token, or WAF problem, and
-# must not be reported as one - the old code surfaced it as the very misleading
+# CIS migration: /Billing/Home and the data API both 302 to this host with no session
+# at all. So a redirect here is never a credential, token, or WAF problem, and must not
+# be reported as one - the old code surfaced it as the very misleading
 # "login step 3: SouthernJwtCookie missing".
 MAINTENANCE_HOST = "friendly-error.southernco.com"
 
@@ -115,6 +144,31 @@ def _looks_like_bot_challenge(status: int, body: str, content_type: str) -> bool
     return False
 
 
+def _form_post_target(body: str, base: str) -> tuple[str, dict[str, str]] | None:
+    """Pull the action and hidden fields out of a self-submitting HTML form.
+
+    Every hop of the post-ForgeRock relay is one of these: an HTML page whose only job
+    is to POST a token onward via inline JS. Attribute order is not guaranteed, so
+    match name and value independently within each <input> rather than as one pattern.
+    """
+    form = re.search(r"<form[^>]*>", body, re.I)
+    if not form:
+        return None
+    action = re.search(r'action="([^"]*)"', form.group(0), re.I)
+    if not action:
+        return None
+
+    fields: dict[str, str] = {}
+    for tag in re.findall(r"<input[^>]*>", body, re.I):
+        name = re.search(r'name="([^"]*)"', tag, re.I)
+        value = re.search(r'value="([^"]*)"', tag, re.I)
+        if name:
+            fields[name.group(1)] = value.group(1) if value else ""
+    if not fields:
+        return None
+    return urljoin(base, action.group(1)), fields
+
+
 class GaPowerApi:
     """Talks to the Southern Company customer portal."""
 
@@ -125,7 +179,13 @@ class GaPowerApi:
         self.jwt: str | None = None
         self.account: str | None = None
         self.company: str | None = None
+        # Opaque ASP.NET Core DataProtection blobs ("CfDJ8..."), ~134 chars each. They
+        # are tied to the app's key ring, so they are resolved fresh on every login
+        # rather than cached across restarts.
+        self.person_id: str | None = None
+        self.premise_id: str | None = None
         self.service_point: str | None = None
+        self.service_agreement: str | None = None
 
     async def _request(self, method: str, url: str, **kw: Any) -> tuple[int, str, dict]:
         """One HTTP call with bounded retry. Returns (status, body_text, headers)."""
@@ -186,103 +246,250 @@ class GaPowerApi:
                 return m.group(1)
         return None
 
+    # ------------------------------------------------------------------ login
+
     async def login(self) -> None:
-        """Four-hop token relay. Raises GaPowerAuthError on bad credentials."""
-        # 1. verification token - real JSON
+        """ForgeRock OIDC login. Raises GaPowerAuthError on bad credentials.
+
+        Deliberately does NOT mint its own OIDC request. The portal is a .NET
+        confidential client: it generates `state`, `nonce` and the PKCE challenge
+        itself, and validates them on the way back. Inventing our own would be
+        rejected, so the flow starts by letting the portal issue its own authorize URL
+        and only then authenticates against ForgeRock.
+        """
+        authorize_url = await self._discover_authorize_url()
+        await self._forgerock_authenticate()
+        await self._replay_authorize(authorize_url)
+        await self._fetch_jwt()
+
+    async def _discover_authorize_url(self) -> str:
+        """Follow the unauthenticated redirect chain until AM's authorize endpoint."""
+        url = f"{CS2}/Billing/Home"
+        for _ in range(MAX_REDIRECTS):
+            status, body, headers = await self._request("GET", url)
+            if status in (301, 302, 303, 307, 308):
+                location = headers["Location"]
+                if not location:
+                    raise GaPowerTransient(f"redirect from {url} carried no Location")
+                url = urljoin(url, location)
+                if "/am/oauth2/authorize" in url:
+                    return url
+                continue
+
+            # Not a redirect. Some hops hand the authorize URL over in the page - either
+            # as a form target or embedded in a `goto` parameter on the login SPA's URL.
+            if status == 200:
+                m = re.search(
+                    r"https?://[^\"'\s]*?/am/oauth2/authorize[^\"'\s]*", body
+                )
+                if m:
+                    return m.group(0).replace("&amp;", "&")
+            raise GaPowerTransient(
+                f"could not reach the ForgeRock authorize endpoint (stopped at "
+                f"{urlparse(url).path} with HTTP {status}) - the login flow may have "
+                "changed again; capture a browser HAR and compare"
+            )
+        raise GaPowerTransient("too many redirects looking for the authorize endpoint")
+
+    async def _forgerock_authenticate(self) -> None:
+        """Two-step callback exchange against AM; leaves a session cookie in the jar."""
+        url = f"{FORGEROCK}{AM_AUTH_PATH}"
+        params = {"authIndexType": "service", "authIndexValue": AM_SERVICE}
+
+        # First POST is empty - AM answers with authId plus a callbacks template.
         status, body, _ = await self._request(
-            "POST",
-            f"{WEBAUTH}/webservices/api/WebUser/Login",
-            json={"username": self._username, "password": self._password},
-            headers={
-                "Referer": f"{WEBAUTH}/SPA/OCC/login",
-                "Accept": "application/json, text/plain, */*",
-            },
+            "POST", url, params=params, json={}, headers=FORGEROCK_HEADERS
         )
         if status != 200:
-            raise GaPowerTransient(f"login step 1: HTTP {status}")
+            raise GaPowerTransient(f"forgerock: callback fetch returned HTTP {status}")
         try:
-            payload = json.loads(body)
+            challenge = json.loads(body)
         except ValueError as err:
-            # a JSON endpoint answering non-JSON is the classic Imperva tell
-            raise GaPowerBotDetected("login endpoint returned non-JSON") from err
-        token = (payload.get("data") or {}).get("token")
-        if not token:
+            raise GaPowerBotDetected("forgerock authenticate returned non-JSON") from err
+        if not challenge.get("callbacks"):
+            raise GaPowerTransient("forgerock: no callbacks in the challenge")
+
+        # Fill the inputs by callback TYPE, not by index or IDToken name. AM renumbers
+        # those whenever the authentication tree is edited; the types are stable.
+        for cb in challenge["callbacks"]:
+            kind = cb.get("type")
+            inputs = cb.get("input") or []
+            if not inputs:
+                continue
+            if kind == "NameCallback":
+                inputs[0]["value"] = self._username
+            elif kind == "PasswordCallback":
+                inputs[0]["value"] = self._password
+            elif kind == "ConfirmationCallback":
+                inputs[0]["value"] = 0  # "Log In", the first option
+
+        status, body, _ = await self._request(
+            "POST", url, params=params, json=challenge, headers=FORGEROCK_HEADERS
+        )
+        if status in (401, 403):
+            raise GaPowerAuthError("Login rejected - check username and password")
+        if status != 200:
+            raise GaPowerTransient(f"forgerock: authenticate returned HTTP {status}")
+        try:
+            result = json.loads(body)
+        except ValueError as err:
+            raise GaPowerBotDetected("forgerock authenticate returned non-JSON") from err
+
+        if not result.get("tokenId"):
+            # A surviving `callbacks` array means AM wants another factor (e.g. an OTP
+            # or a security question), which this integration cannot answer.
+            if result.get("callbacks"):
+                raise GaPowerAuthError(
+                    "Georgia Power is asking for an additional login step "
+                    "(MFA or a security question). Sign in through the website once to "
+                    "clear it; if MFA is enabled on the account this integration "
+                    "cannot log in."
+                )
             raise GaPowerAuthError("Login rejected - check username and password")
 
-        # 2. ScWebToken - scraped from an HTML hidden input
-        status, body, _ = await self._request(
-            "POST", f"{WEBAUTH}/SPA/Navigation", data={"Token": token, "ReturnUrl": "none"}
-        )
-        if status != 200:
-            raise GaPowerTransient(f"login step 2: HTTP {status}")
-        m = re.search(r'name="ScWebToken"\s+value="(\S+\.\S+\.\S+)"', body, re.I)
-        if not m:
-            # loading shell WITH the token is normal; WITHOUT it means JS never ran
-            # for us, i.e. a challenge rather than a changed login flow
-            if LOADING_SHELL in body[:4000].lower():
-                raise GaPowerBotDetected("SPA/Navigation returned a JS challenge shell")
-            raise GaPowerTransient("ScWebToken not found - login flow may have changed")
+    async def _replay_authorize(self, authorize_url: str) -> None:
+        """Re-request authorize with a live AM session, then ride the relay home.
 
-        # 3. SouthernJwtCookie - 302 + Set-Cookie
-        status, _, headers = await self._request(
-            "POST",
-            f"{CS2}/Account/LoginComplete",
-            params={"ReturnUrl": "/Billing/Home"},
-            data={"ScWebToken": m.group(1)},
-        )
-        if status != 302:
-            raise GaPowerTransient(f"login step 3: expected 302, got {status}")
-        sjc = self._cookie(headers, "SouthernJwtCookie")
-        if not sjc:
-            raise GaPowerTransient("login step 3: SouthernJwtCookie missing")
+        Each hop is either a redirect or a self-submitting form carrying the auth code
+        onward: AM -> webauth/signin-forgerock-oidc-authcode ->
+        webauth/ExternalAuthentication -> customerservice2/Account/LoginComplete.
+        """
+        url, method, data = authorize_url, "GET", None
 
-        # 4. final bearer JWT
+        for _ in range(MAX_REDIRECTS):
+            kw: dict[str, Any] = {"data": data} if data else {}
+            status, body, headers = await self._request(method, url, **kw)
+
+            if status in (301, 302, 303, 307, 308):
+                location = headers["Location"]
+                if not location:
+                    raise GaPowerTransient(f"redirect from {url} carried no Location")
+                url, method, data = urljoin(url, location), "GET", None
+                # LoginComplete's redirect is the end of the relay: the portal session
+                # cookie is set on this response, and following it just fetches a page
+                # we do not need.
+                if "/Account/LoginComplete" in urlparse(url).path:
+                    continue
+                if urlparse(url).path.rstrip("/") in ("/Billing/Home", "/Billing"):
+                    return
+                continue
+
+            if status != 200:
+                raise GaPowerTransient(f"login relay: HTTP {status} from {url.split('?')[0]}")
+
+            target = _form_post_target(body, url)
+            if target is None:
+                if LOADING_SHELL in body[:4000].lower():
+                    raise GaPowerBotDetected(
+                        f"{urlparse(url).path} returned a JS challenge shell"
+                    )
+                raise GaPowerTransient(
+                    f"login relay stalled at {urlparse(url).path}: expected a redirect "
+                    "or a self-submitting form, got neither"
+                )
+            url, method, data = target[0], "POST", target[1]
+
+        raise GaPowerTransient("too many hops completing the login relay")
+
+    async def _fetch_jwt(self) -> None:
+        """Collect the bearer token the occ* services want.
+
+        The endpoint answers 200 with `Data: null` and delivers the token as a cookie,
+        so read the jar rather than the body. Session cookies from the relay are
+        already attached by aiohttp.
+        """
         status, _, headers = await self._request(
             "GET",
             f"{CS2}/Account/LoginValidated/JwtToken",
-            headers={"Cookie": f"SouthernJwtCookie={sjc}"},
+            headers={"Accept": "application/json, text/plain, */*", "Referer": f"{CS2}/Billing/Home"},
         )
         self.jwt = self._cookie(headers, "ScJwtToken")
         if not self.jwt:
-            raise GaPowerTransient(f"login step 4: ScJwtToken missing (HTTP {status})")
+            for cookie in self._session.cookie_jar:
+                if cookie.key == "ScJwtToken":
+                    self.jwt = cookie.value
+                    break
+        if not self.jwt:
+            raise GaPowerTransient(
+                f"ScJwtToken missing after login (HTTP {status}) - the portal session "
+                "did not take, so the relay completed without authenticating"
+            )
+
+    # ------------------------------------------------------------------ data
 
     @property
     def _auth(self) -> dict[str, str]:
-        return {"Authorization": f"bearer {self.jwt}", "Accept": "application/json"}
+        return {
+            "Authorization": f"bearer {self.jwt}",
+            "Accept": "application/json, text/plain, */*",
+            "userid": self._username,
+            "devicetype": DEVICE_TYPE,
+            "Origin": CS2,
+            "Referer": f"{CS2}/",
+        }
+
+    async def _get_json(self, url: str, label: str, **kw: Any) -> dict:
+        status, body, _ = await self._request("GET", url, headers=self._auth, **kw)
+        if status in (401, 403):
+            raise GaPowerTransient(f"{label}: HTTP {status} - session expired")
+        if status != 200:
+            raise GaPowerTransient(f"{label}: HTTP {status}")
+        try:
+            return json.loads(body)
+        except ValueError as err:
+            raise GaPowerBotDetected(f"{label} returned non-JSON") from err
 
     async def resolve_account(self) -> None:
-        """Find the account number, company code, and service point."""
-        status, body, _ = await self._request(
-            "GET", f"{API}/account/getAllAccounts", headers=self._auth
-        )
-        if status != 200:
-            raise GaPowerTransient(f"getAllAccounts: HTTP {status}")
-        accounts = (json.loads(body).get("Data")) or []
+        """Resolve the account and the four identifiers the usage API requires."""
+        payload = await self._get_json(f"{ACCOUNT_API}/Cap/", "Cap")
+        accounts = payload.get("data") or []
         if not accounts:
             raise GaPowerError("No accounts returned")
-        acct = accounts[0]
-
-        raw = acct.get("Company")
-        self.company = COMPANY_MAP.get(raw, str(raw)) if isinstance(raw, int) else raw
-
-        for key in ("Number", "number", "AccountNumber", "accountNumber", "Account", "account"):
-            if acct.get(key):
-                self.account = str(acct[key])
-                break
+        acct = next((a for a in accounts if a.get("isPrimaryAccount")), accounts[0])
+        self.account = str(acct.get("accountNumber") or "")
+        self.company = acct.get("company") or "GPC"
         if not self.account:
             raise GaPowerError(f"Account number not found; keys: {sorted(acct)}")
 
-        status, body, _ = await self._request(
-            "GET",
-            f"{API}/MyPowerUsage/getMPUBasicAccountInformation/{self.account}/{self.company}",
-            headers=self._auth,
+        summary = await self._get_json(
+            f"{ACCOUNT_API}/Accounts/{self.account}/Summary", "Accounts/Summary"
         )
-        if status != 200:
-            raise GaPowerTransient(f"getMPUBasicAccountInformation: HTTP {status}")
-        points = (json.loads(body).get("Data") or {}).get("meterAndServicePoints") or []
-        if not points:
-            raise GaPowerError(f"No service points for company={self.company}")
-        self.service_point = points[0]["servicePointNumber"]
+        data = summary.get("data") or {}
+        self.person_id = data.get("mainPersonId")
+
+        # Accounts can carry gas and other agreements alongside electric; only the
+        # active electric one has hourly interval data behind it.
+        agreements = data.get("serviceAgreements") or []
+        agreement = next(
+            (
+                a
+                for a in agreements
+                if a.get("serviceTypeCode") == "E" and a.get("isActive")
+            ),
+            None,
+        )
+        if agreement is None:
+            kinds = sorted({str(a.get("serviceTypeCode")) for a in agreements})
+            raise GaPowerError(f"No active electric service agreement; found {kinds}")
+        self.service_agreement = agreement.get("serviceAgreementId")
+        self.premise_id = agreement.get("premiseId")
+
+        points = agreement.get("servicePoints") or data.get("servicePoints") or []
+        if points:
+            self.service_point = points[0].get("servicePointId")
+
+        missing = [
+            n
+            for n, v in (
+                ("personId", self.person_id),
+                ("serviceAgreementId", self.service_agreement),
+                ("premiseId", self.premise_id),
+                ("servicePointId", self.service_point),
+            )
+            if not v
+        ]
+        if missing:
+            raise GaPowerError(f"Account summary missing required ids: {missing}")
 
     async def async_get_hourly(
         self, start: dt.date, last_day: dt.date
@@ -304,32 +511,53 @@ class GaPowerApi:
         return out
 
     async def _fetch_chunk(self, start: dt.date, last_day: dt.date) -> dict | None:
+        # UNVERIFIED on this route: the 2026-09-08 capture only ever requested ONE day
+        # of hourly data at a time, so CHUNK_DAYS=30 is carried over from the retired
+        # MPUData endpoint rather than confirmed here. If backfill returns short or
+        # empty windows, suspect a server-side cap first and lower CHUNK_DAYS - the
+        # portal exposes its own limit at
+        # occcustomerserviceapi /api/v1/Utilities/getRegistryValue?key=HOURLY_BULK_EXPORT_DAYS,
+        # which is worth reading before guessing.
         params = {
-            "OPCO": self.company,
-            "ServicePointNumber": self.service_point,
+            "accountId": self.account,
+            "personId": self.person_id,
+            "operatingCompany": self.company,
+            "startDate": start.strftime("%m/%d/%Y"),
+            # endDate is EXCLUSIVE -> last wanted day + 1
+            "endDate": (last_day + dt.timedelta(days=1)).strftime("%m/%d/%Y"),
+            "servicePointId": self.service_point,
+            "premiseId": self.premise_id,
+            # Literal string "null" - that is what the portal sends, and an omitted
+            # parameter is not equivalent.
+            "billFactorCode": "null",
             "intervalBehavior": "Automatic",
-            "StartDate": start.strftime("%m/%d/%Y"),
-            # EndDate is EXCLUSIVE -> last wanted day + 1
-            "EndDate": (last_day + dt.timedelta(days=1)).strftime("%m/%d/%Y"),
         }
-        status, body, _ = await self._request(
-            "GET",
-            f"{API}/MyPowerUsage/MPUData/{self.account}/Hourly",
-            headers=self._auth,
+        payload = await self._get_json(
+            f"{USAGE_API}/MyPowerUsage/UsageGraphData/{self.service_agreement}/Hourly",
+            "UsageGraphData/Hourly",
             params=params,
         )
-        if status != 200:
-            raise GaPowerTransient(f"MPUData/Hourly: HTTP {status}")
-        data = (json.loads(body).get("Data")) or {}
-        raw = data.get("Data")
-        if not data.get("HasData") or raw is None:
+        data = payload.get("data") or {}
+        if not data.get("hasData"):
             _LOGGER.debug("No hourly data for %s .. %s", start, last_day)
             return None
-        return json.loads(raw)
+        inner = data.get("data")
+        # The old MPUData route nested a JSON *string* here; the replacement returns a
+        # real object. Accept both so a rollback in either direction still parses.
+        if isinstance(inner, str):
+            try:
+                inner = json.loads(inner)
+            except ValueError:
+                return None
+        return inner if isinstance(inner, dict) else None
 
 
 def _parse_ts(pt: dict[str, Any]) -> dt.datetime | None:
-    """Hourly points carry a naive local ISO timestamp in `name`; `x` is always 0."""
+    """Points carry a naive local ISO timestamp in `name`.
+
+    `x` used to be a constant 0 and is now the hour's index within the response;
+    either way it is not a timestamp, so `name` remains the only usable field.
+    """
     name = pt.get("name")
     if isinstance(name, str):
         s = name.strip()
