@@ -9,6 +9,19 @@ cron, no separate Python environment.
 - Native config flow, and a reauth prompt if the credentials stop working
 - **Zero PyPI dependencies** — uses `aiohttp`, which HA already ships
 
+> ## ⚠️ Status: BROKEN as of 2026-09-08 — auth rewrite in progress
+>
+> Southern Company's Aug 31 – Sep 8 2026 CIS migration **replaced the entire login
+> system** with ForgeRock/PingAM OIDC, and moved the usage API to new hosts. The
+> four-hop token relay this integration uses still returns `200`s but no longer
+> produces a valid session, so logins fail at `login step 4: ScJwtToken missing`.
+>
+> This needs a rewrite of the auth chain and the data client, not a patch. See
+> [2026-09 migration](#2026-09-southern-company-migration) below for the full
+> mapping of what changed. Existing statistics are safe, and because the
+> integration re-fetches `REFETCH_DAYS` (45) on every run, the outage gap
+> backfills automatically once auth works again.
+
 ## Why not `southern-company-hacs`?
 
 That integration is the obvious alternative. Reasons this exists instead:
@@ -76,9 +89,69 @@ actions:
   that value below a billing cycle or the understated numbers become permanent.
   Usage (kWh) is not affected, only cost.
 - Southern Company changes their login flow every so often. When they do, this breaks until the
-  auth chain is updated — expect that once or twice a year.
+  auth chain is updated — expect that once or twice a year. It happened in September 2026, and
+  that one was a full replacement rather than a tweak: see
+  [2026-09 migration](#2026-09-southern-company-migration).
 - Bot protection (Imperva) can block requests from your IP for ~30 minutes. The integration backs
   off rather than hammering.
+
+## 2026-09 Southern Company migration
+
+Southern Company ran a planned CIS migration **Aug 31 – Sep 8 2026**. During the outage every
+`customerservice2` route — including unauthenticated ones — `302`'d to
+`friendly-error.southernco.com`; the integration now detects that specifically and reports it as
+a utility-side outage rather than a credential problem.
+
+What came back afterwards is a different system.
+
+### Auth moved to ForgeRock/PingAM OIDC
+
+| | before | after |
+|---|---|---|
+| Credential endpoint | `webauth…/webservices/api/WebUser/Login` (flat JSON) | `customerlogin.southernco.com/am/json/realms/root/realms/alpha/authenticate` (ForgeRock `callbacks[]`) |
+| Service selector | — | `?authIndexType=service&authIndexValue=occSecureLogin` |
+| Token exchange | `webauth…/SPA/Navigation` → scrape `ScWebToken` from a hidden input | `/am/oauth2/authorize`, OIDC auth-code + **PKCE S256**, `client_id=webauthclient`, `response_mode=form_post` |
+| Landing | `POST customerservice2…/Account/LoginComplete` | same, but reached via `webauth…/SPA/signin-forgerock-oidc-authcode` → `/SPA/ExternalAuthentication/forgerock-oidc-authcode` |
+
+`/Account/LoginValidated/JwtToken` still exists and still answers `200`, with
+`{"StatusCode":200,"Message":"Successfully retrieved jwtToken.","Data":null}`. **The step-4
+failure is a symptom, not the bug** — the request is fine, the session behind it isn't. Patching
+step 4 is wasted effort.
+
+### The usage API moved too
+
+`customerservice2api…/MPUData` is gone. Hourly data now comes from:
+
+```
+GET https://occmypowerusageapi.southerncompany.com
+    /api/v1/MyPowerUsage/UsageGraphData/{serviceAgreementId}/Hourly
+    ?accountId=…&personId=…&operatingCompany=GPC
+    &startDate=MM/DD/YYYY&endDate=MM/DD/YYYY
+    &servicePointId=…&premiseId=…
+    &billFactorCode=null&intervalBehavior=Automatic
+```
+
+`Daily` and `Monthly` are sibling routes on the same path. It needs four opaque ~134-character
+identifiers — `serviceAgreementId`, `personId`, `servicePointId`, `premiseId` — sourced from
+`occaccountapi…/api/v1/Accounts/{accountId}/Summary` and `occpersonapi…/api/v1/person/{personId}`.
+Related hosts in the same family: `occbillingapi`, `occcustomerserviceapi`, `occoutageapi`,
+`occpaymentapi`. There is also a bulk-export path hinted at by
+`occcustomerserviceapi…/api/v1/Utilities/getRegistryValue?key=HOURLY_BULK_EXPORT_DAYS`, which may
+be cleaner than reading the graph endpoint.
+
+**All three endpoint quirks below survived the migration unchanged.**
+
+### How this was diagnosed, and one security warning
+
+The scripted diagnostic in `tools/` was actively misleading here — see the warning in its
+docstring. What actually worked was capturing a **browser HAR** of a real manual login and diffing
+it against what the integration sends.
+
+> ⚠️ **Do not treat a HAR of a login as safe, even a "sanitized" one.** Chrome's
+> *Save as HAR (sanitized)* strips cookies, auth headers, and the `"password"` JSON key — but it
+> does **not** understand ForgeRock's `callbacks[]` array, so the account password was written to
+> the "sanitized" file in plaintext anyway. Parse HARs with a redacting script rather than reading
+> them raw, delete them afterwards, and rotate any password one has touched.
 
 ## Endpoint quirks (do not "fix" these)
 
