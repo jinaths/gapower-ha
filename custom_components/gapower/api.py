@@ -144,6 +144,12 @@ def _looks_like_bot_challenge(status: int, body: str, content_type: str) -> bool
     return False
 
 
+def _attr(tag: str, name: str) -> str | None:
+    """Read one HTML attribute, tolerating either quote style and loose spacing."""
+    m = re.search(rf"""{name}\s*=\s*["']([^"']*)["']""", tag, re.I)
+    return m.group(1) if m else None
+
+
 def _form_post_target(body: str, base: str) -> tuple[str, dict[str, str]] | None:
     """Pull the action and hidden fields out of a self-submitting HTML form.
 
@@ -151,22 +157,24 @@ def _form_post_target(body: str, base: str) -> tuple[str, dict[str, str]] | None
     is to POST a token onward via inline JS. Attribute order is not guaranteed, so
     match name and value independently within each <input> rather than as one pattern.
     """
-    form = re.search(r"<form[^>]*>", body, re.I)
+    form = re.search(r"<form([^>]*)>(.*?)</form>", body, re.I | re.S)
     if not form:
         return None
-    action = re.search(r'action="([^"]*)"', form.group(0), re.I)
-    if not action:
+    action = _attr(form.group(1), "action")
+    if action is None:
         return None
 
+    # Scoped to this form's own content. Reading <input>s from the whole document
+    # would fold in fields from any other form on the page - harmless on the relay's
+    # bare auto-submit shells, wrong the moment one of them gains a second form.
     fields: dict[str, str] = {}
-    for tag in re.findall(r"<input[^>]*>", body, re.I):
-        name = re.search(r'name="([^"]*)"', tag, re.I)
-        value = re.search(r'value="([^"]*)"', tag, re.I)
+    for tag in re.findall(r"<input[^>]*>", form.group(2), re.I):
+        name = _attr(tag, "name")
         if name:
-            fields[name.group(1)] = value.group(1) if value else ""
+            fields[name] = _attr(tag, "value") or ""
     if not fields:
         return None
-    return urljoin(base, action.group(1)), fields
+    return urljoin(base, action), fields
 
 
 class GaPowerApi:
@@ -248,6 +256,30 @@ class GaPowerApi:
 
     # ------------------------------------------------------------------ login
 
+    def _reset_session(self) -> None:
+        """Drop every trace of the previous session.
+
+        The coordinator builds one GaPowerApi per config entry and reuses it, so the
+        cookie jar outlives a poll. Discovery below depends on getting the *logged
+        out* redirect chain, which an inherited session would quietly suppress - so a
+        full login always starts from a clean jar.
+        """
+        self._session.cookie_jar.clear()
+        self.jwt = None
+        self.account = self.company = None
+        self.person_id = self.premise_id = None
+        self.service_point = self.service_agreement = None
+
+    async def _session_is_live(self) -> bool:
+        """Cheap probe: is the session from the last poll still usable?"""
+        if self.jwt is None:
+            return False
+        try:
+            await self._fetch_jwt()
+        except GaPowerTransient:
+            return False
+        return True
+
     async def login(self) -> None:
         """ForgeRock OIDC login. Raises GaPowerAuthError on bad credentials.
 
@@ -257,6 +289,15 @@ class GaPowerApi:
         rejected, so the flow starts by letting the portal issue its own authorize URL
         and only then authenticates against ForgeRock.
         """
+        # Reuse a still-valid session rather than re-authenticating. This turns a
+        # routine poll into one request instead of roughly eight, and every login
+        # avoided is one fewer credential POST against a portal whose terms this
+        # already stretches. GaPowerBotDetected and GaPowerMaintenance deliberately
+        # propagate out of the probe - those mean stop, not try harder.
+        if await self._session_is_live():
+            return
+
+        self._reset_session()
         authorize_url = await self._discover_authorize_url()
         await self._forgerock_authenticate()
         await self._replay_authorize(authorize_url)
@@ -365,12 +406,13 @@ class GaPowerApi:
                 if not location:
                     raise GaPowerTransient(f"redirect from {url} carried no Location")
                 url, method, data = urljoin(url, location), "GET", None
-                # LoginComplete's redirect is the end of the relay: the portal session
-                # cookie is set on this response, and following it just fetches a page
-                # we do not need.
-                if "/Account/LoginComplete" in urlparse(url).path:
-                    continue
-                if urlparse(url).path.rstrip("/") in ("/Billing/Home", "/Billing"):
+                parts = urlparse(url)
+                # Landing on an ordinary portal page means the relay finished and the
+                # session cookie is set; following it would only fetch a page we do not
+                # need. /Account/* is still the relay itself, so keep going there.
+                if parts.netloc == urlparse(CS2).netloc and not parts.path.lower().startswith(
+                    "/account/"
+                ):
                     return
                 continue
 
@@ -401,8 +443,18 @@ class GaPowerApi:
         status, _, headers = await self._request(
             "GET",
             f"{CS2}/Account/LoginValidated/JwtToken",
-            headers={"Accept": "application/json, text/plain, */*", "Referer": f"{CS2}/Billing/Home"},
+            headers={
+                "Accept": "application/json, text/plain, */*",
+                "Referer": f"{CS2}/Billing/Home",
+            },
         )
+        # Status matters as much as the cookie. A dead session answers with a redirect
+        # to the login page while a stale ScJwtToken may still be sitting in the jar -
+        # without this check that combination probes as a live session forever.
+        if status != 200:
+            raise GaPowerTransient(
+                f"JwtToken endpoint returned HTTP {status} - no valid portal session"
+            )
         self.jwt = self._cookie(headers, "ScJwtToken")
         if not self.jwt:
             for cookie in self._session.cookie_jar:
@@ -431,6 +483,10 @@ class GaPowerApi:
     async def _get_json(self, url: str, label: str, **kw: Any) -> dict:
         status, body, _ = await self._request("GET", url, headers=self._auth, **kw)
         if status in (401, 403):
+            # Force the next poll through a full login rather than reusing a session
+            # the server has already rejected. Without this a stale session keeps
+            # probing as live and the integration never recovers on its own.
+            self._reset_session()
             raise GaPowerTransient(f"{label}: HTTP {status} - session expired")
         if status != 200:
             raise GaPowerTransient(f"{label}: HTTP {status}")
@@ -441,6 +497,20 @@ class GaPowerApi:
 
     async def resolve_account(self) -> None:
         """Resolve the account and the four identifiers the usage API requires."""
+        # The identifiers are session-scoped DataProtection blobs, so they stay valid
+        # exactly as long as the session does - and _reset_session clears them together
+        # with it. Skipping the re-resolve saves two requests on every reused poll.
+        if all(
+            (
+                self.account,
+                self.person_id,
+                self.service_agreement,
+                self.premise_id,
+                self.service_point,
+            )
+        ):
+            return
+
         payload = await self._get_json(f"{ACCOUNT_API}/Cap/", "Cap")
         accounts = payload.get("data") or []
         if not accounts:
