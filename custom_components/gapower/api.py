@@ -97,6 +97,10 @@ BACKOFF_CAP = 30.0
 REQUEST_DELAY = 1.0
 MAX_REDIRECTS = 10
 
+# Re-login this far before the bearer actually expires, so a long backfill cannot
+# have the token die underneath it mid-run.
+TOKEN_MARGIN = dt.timedelta(minutes=10)
+
 UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36"
@@ -172,6 +176,15 @@ def _attr(tag: str, name: str) -> str | None:
     return m.group(1) if m else None
 
 
+def _exp_utc(claims: dict[str, Any]) -> dt.datetime | None:
+    """The token's expiry as an aware UTC datetime, or None if it has none."""
+    exp = claims.get("exp")
+    try:
+        return dt.datetime.fromtimestamp(float(exp), dt.timezone.utc)
+    except (TypeError, ValueError):
+        return None
+
+
 def _jwt_claims(token: str) -> dict[str, Any]:
     """Decode a JWT payload without verifying it. {} if it is not readable."""
     try:
@@ -217,7 +230,7 @@ class GaPowerApi:
         self._username = username
         self._password = password
         self.jwt: str | None = None
-        self.accounts_jwt: str | None = None
+        self._soft_auth = False
         self.account_auth: str | None = None
         self.account: str | None = None
         self.company: str | None = None
@@ -293,12 +306,18 @@ class GaPowerApi:
               : headers.get("ScSoftAuthJwtToken") && setSessionToken(...)
             headers.get("ScAccountsJwtToken") && setAccountsToken(...)
         """
-        session = headers.get("ScJwtToken") or headers.get("ScSoftAuthJwtToken")
-        if session:
-            self.jwt = session
-        accounts = headers.get("ScAccountsJwtToken")
-        if accounts:
-            self.accounts_jwt = accounts
+        full = headers.get("ScJwtToken")
+        if full:
+            self.jwt = full
+            self._soft_auth = False
+        elif headers.get("ScSoftAuthJwtToken") and (self.jwt is None or self._soft_auth):
+            # Soft auth is a partially-authenticated token. Their client prefers the
+            # full one, but only within a single response - across responses a later
+            # soft token would silently downgrade a good session, and the occ*
+            # services would start refusing us for no visible reason. Only ever
+            # accept it when we do not already hold a full token.
+            self.jwt = headers["ScSoftAuthJwtToken"]
+            self._soft_auth = True
         account_auth = headers.get("account-authorization")
         if account_auth:
             self.account_auth = account_auth
@@ -323,15 +342,30 @@ class GaPowerApi:
         """
         self._session.cookie_jar.clear()
         self.jwt = None
-        self.accounts_jwt = None
+        self._soft_auth = False
         self.account_auth = None
         self.account = self.company = None
         self.person_id = self.premise_id = None
         self.service_point = self.service_agreement = None
 
+    def _token_valid_for(self, margin: dt.timedelta = TOKEN_MARGIN) -> bool:
+        """True if the held bearer is still good, judged from its own `exp`."""
+        if not self.jwt:
+            return False
+        expires = _exp_utc(_jwt_claims(self.jwt))
+        if expires is None:
+            return False  # unreadable expiry - do not gamble, re-login
+        return dt.datetime.now(dt.timezone.utc) + margin < expires
+
     async def _session_is_live(self) -> bool:
-        """Cheap probe: is the session from the last poll still usable?"""
-        if self.jwt is None:
+        """Is the session from the last poll still usable?
+
+        Answered from the token's own `exp` first, which costs nothing. Only when
+        that says the token should still be good do we spend requests confirming it -
+        and an expired token skips the probe entirely and goes straight to login,
+        rather than paying for two requests to be told what the claim already said.
+        """
+        if not self._token_valid_for():
             return False
         try:
             await self._fetch_jwt()
@@ -589,9 +623,9 @@ class GaPowerApi:
             )
         claims = _jwt_claims(self.jwt)
         _LOGGER.debug(
-            "bearer acquired: len=%s iss=%s aud=%s claims=%s accounts_token=%s",
-            len(self.jwt), claims.get("iss"), claims.get("aud"), sorted(claims),
-            bool(self.accounts_jwt),
+            "bearer acquired: len=%s iss=%s aud=%s soft_auth=%s expires=%s",
+            len(self.jwt), claims.get("iss"), claims.get("aud"), self._soft_auth,
+            _exp_utc(claims),
         )
 
     # ------------------------------------------------------------------ data
@@ -764,7 +798,28 @@ class GaPowerApi:
                 inner = json.loads(inner)
             except ValueError:
                 return None
-        return inner if isinstance(inner, dict) else None
+        if not isinstance(inner, dict):
+            return None
+
+        # CHUNK_DAYS is inherited from the retired MPUData route and has never been
+        # confirmed against this one, so check what actually came back rather than
+        # trusting it. A server-side cap would return a short window and silently
+        # leave holes in the history.
+        labels = (inner.get("xAxis") or {}).get("labels") or []
+        wanted = (last_day - start).days + 1
+        if labels and len(labels) < wanted * 24 * 0.9:
+            _LOGGER.warning(
+                "Requested %s days of hourly data (%s..%s) but got %s points, about "
+                "%.1f days. The endpoint is probably capping the window - lower "
+                "CHUNK_DAYS (currently %s) to avoid gaps.",
+                wanted, start, last_day, len(labels), len(labels) / 24, CHUNK_DAYS,
+            )
+        else:
+            _LOGGER.debug(
+                "chunk %s..%s: %s points for %s day(s) requested", start, last_day,
+                len(labels), wanted,
+            )
+        return inner
 
 
 def _parse_ts(pt: dict[str, Any]) -> dt.datetime | None:
