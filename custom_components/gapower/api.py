@@ -55,6 +55,10 @@ USAGE_API = "https://occmypowerusageapi.southerncompany.com/api/v1"
 AM_AUTH_PATH = "/am/json/realms/root/realms/alpha/authenticate"
 AM_SERVICE = "occSecureLogin"
 
+# Used only if AM's serverinfo lookup fails. Observed 2026-09-08; this tenant does not
+# use the stock `iPlanetDirectoryPro`, and the value is specific to their deployment.
+AM_COOKIE_FALLBACK = "c4928758b74fd64"
+
 # Where webauth issues the OIDC challenge that starts a login.
 WEBAUTH_OIDC_INIT = f"{WEBAUTH}/SPA/ExternalAuthentication/forgerock-oidc-authcode"
 
@@ -402,7 +406,8 @@ class GaPowerApi:
         except ValueError as err:
             raise GaPowerBotDetected("forgerock authenticate returned non-JSON") from err
 
-        if not result.get("tokenId"):
+        token_id = result.get("tokenId")
+        if not token_id:
             # A surviving `callbacks` array means AM wants another factor (e.g. an OTP
             # or a security question), which this integration cannot answer.
             if result.get("callbacks"):
@@ -413,6 +418,38 @@ class GaPowerApi:
                     "cannot log in."
                 )
             raise GaPowerAuthError("Login rejected - check username and password")
+
+        # AM returns the session as `tokenId` in the body and does NOT set the session
+        # cookie itself, so the authorize call that follows would arrive
+        # unauthenticated. webauth then quietly falls through to WL_ReturnUrl and the
+        # relay "succeeds" with no session at all, surfacing much later as a missing
+        # ScJwtToken. Set the cookie explicitly.
+        await self._set_am_session(token_id)
+
+    async def _set_am_session(self, token_id: str) -> None:
+        """Install AM's session token as a cookie on the ForgeRock domain.
+
+        The cookie's name is deployment-specific (this tenant uses a random-looking
+        hex string, not the stock `iPlanetDirectoryPro`), so ask AM for it rather than
+        hard-coding it and silently breaking if they redeploy.
+        """
+        name = AM_COOKIE_FALLBACK
+        try:
+            status, body, _ = await self._request(
+                "GET",
+                f"{FORGEROCK}/am/json/serverinfo/*",
+                headers={"Accept": "application/json"},
+            )
+            if status == 200:
+                name = (json.loads(body) or {}).get("cookieName") or name
+        except (GaPowerError, ValueError):
+            # Non-fatal: fall back to the known name and let the login attempt itself
+            # report the real failure if that name is wrong.
+            _LOGGER.debug("serverinfo lookup failed; using fallback AM cookie name")
+
+        self._session.cookie_jar.update_cookies(
+            {name: token_id}, response_url=URL(FORGEROCK)
+        )
 
     async def _replay_authorize(self, authorize_url: str) -> None:
         """Re-request authorize with a live AM session, then ride the relay home.
