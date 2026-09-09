@@ -36,6 +36,7 @@ import json
 import logging
 import random
 import re
+import uuid
 from typing import Any
 from urllib.parse import urlencode, urljoin, urlparse
 
@@ -171,12 +172,6 @@ def _attr(tag: str, name: str) -> str | None:
     return m.group(1) if m else None
 
 
-# The portal page embeds several JWT-shaped strings: Dynatrace's RUM config and
-# Imperva's client SDK both carry lookalikes, so taking the first match is a coin flip.
-_BEARER_DECOYS = ("dtconfig", "ruxit", "dynatrace", "incapsula", "reese84", "_incapsula_")
-_BEARER_HINTS = ("jwt", "bearer", "accesstoken", "access_token", "token", "authorization")
-
-
 def _jwt_claims(token: str) -> dict[str, Any]:
     """Decode a JWT payload without verifying it. {} if it is not readable."""
     try:
@@ -185,41 +180,6 @@ def _jwt_claims(token: str) -> dict[str, Any]:
         return json.loads(base64.urlsafe_b64decode(payload))
     except Exception:  # noqa: BLE001 - a malformed segment just means "not a JWT"
         return {}
-
-
-def _pick_bearer(body: str) -> str | None:
-    """Choose the occ* API bearer from the JWTs embedded in the authenticated page.
-
-    Scored rather than positional: the assignment it sits on and its own claims are
-    what separate the real bearer from the analytics and WAF lookalikes beside it.
-    """
-    best: tuple[int, str] | None = None
-    for m in re.finditer(
-        r"eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}", body
-    ):
-        token = m.group(0)
-        context = body[max(0, m.start() - 80) : m.start()].lower()
-        claims = _jwt_claims(token)
-
-        score = 0
-        if any(h in context for h in _BEARER_HINTS):
-            score += 3
-        if any(d in context for d in _BEARER_DECOYS):
-            score -= 6
-        origin = (str(claims.get("iss", "")) + str(claims.get("aud", ""))).lower()
-        if "southern" in origin or "occ" in origin:
-            score += 3
-        if claims:
-            score += 1
-        # Names and claim keys only - never a token or claim value.
-        _LOGGER.debug(
-            "bearer candidate: score=%s len=%s after=%r claims=%s iss=%s aud=%s",
-            score, len(token), context[-40:].strip(), sorted(claims),
-            claims.get("iss"), claims.get("aud"),
-        )
-        if best is None or score > best[0]:
-            best = (score, token)
-    return best[1] if best else None
 
 
 def _form_post_target(body: str, base: str) -> tuple[str, dict[str, str]] | None:
@@ -257,6 +217,8 @@ class GaPowerApi:
         self._username = username
         self._password = password
         self.jwt: str | None = None
+        self.accounts_jwt: str | None = None
+        self.account_auth: str | None = None
         self.account: str | None = None
         self.company: str | None = None
         # Opaque ASP.NET Core DataProtection blobs ("CfDJ8..."), ~134 chars each. They
@@ -286,6 +248,7 @@ class GaPowerApi:
                         "Set-Cookie": resp.headers.getall("Set-Cookie", []),
                         "Location": resp.headers.get("Location", ""),
                     }
+                    self._harvest_tokens(resp.headers)
             except (aiohttp.ClientError, asyncio.TimeoutError) as err:
                 last = err
                 if attempt == MAX_RETRIES:
@@ -318,6 +281,28 @@ class GaPowerApi:
 
         raise GaPowerTransient(str(last))
 
+    def _harvest_tokens(self, headers: Any) -> None:
+        """Mirror the portal SPA's response interceptor.
+
+        The bearer arrives as a response HEADER on any request - not a cookie and not
+        a body field, which is why /Account/LoginValidated/JwtToken read as empty:
+        200, "Data": null, no Set-Cookie, and the token sitting in ScJwtToken all
+        along. Straight from their own client:
+
+            headers.get("ScJwtToken") ? setSessionToken(...)
+              : headers.get("ScSoftAuthJwtToken") && setSessionToken(...)
+            headers.get("ScAccountsJwtToken") && setAccountsToken(...)
+        """
+        session = headers.get("ScJwtToken") or headers.get("ScSoftAuthJwtToken")
+        if session:
+            self.jwt = session
+        accounts = headers.get("ScAccountsJwtToken")
+        if accounts:
+            self.accounts_jwt = accounts
+        account_auth = headers.get("account-authorization")
+        if account_auth:
+            self.account_auth = account_auth
+
     @staticmethod
     def _cookie(headers: dict, name: str) -> str | None:
         for raw in headers.get("Set-Cookie", []):
@@ -338,6 +323,8 @@ class GaPowerApi:
         """
         self._session.cookie_jar.clear()
         self.jwt = None
+        self.accounts_jwt = None
+        self.account_auth = None
         self.account = self.company = None
         self.person_id = self.premise_id = None
         self.service_point = self.service_agreement = None
@@ -575,31 +562,18 @@ class GaPowerApi:
         Read out of the authenticated portal page. Session cookies from the relay are
         already attached by aiohttp.
         """
-        # The bearer comes out of the authenticated portal page, not from
-        # /Account/LoginValidated/JwtToken. That endpoint answers 200 with
-        # `"Data": null` and sets no cookie (verified in the log and in a browser
-        # capture), and the page's own scripts were already calling the occ* services
-        # before it ran - so it cannot be the source. The session cookie is no help
-        # either: it is host-only on customerservice2 and is never sent to the
-        # occ*api.southerncompany.com siblings, which is exactly why they answered 401.
-        status, body, _ = await self._request(
+        # Both of these are ordinary requests; the tokens ride back on their
+        # response headers and _harvest_tokens picks them up. The portal page is
+        # fetched first because that is what the browser does, and it is the request
+        # that establishes the account-authorization header for later calls.
+        status, _, _ = await self._request(
             "GET", f"{CS2}/Billing/Home", headers={"Referer": f"{CS2}/"}
         )
         if status != 200:
             raise GaPowerTransient(
                 f"portal page returned HTTP {status} after login - no valid session"
             )
-        token = _pick_bearer(body)
-        _LOGGER.debug(
-            "portal page: %s bytes, bearer %s", len(body), "selected" if token else "NOT found"
-        )
-        if token:
-            self.jwt = token
-            return
-        # Legacy fallback: older deployments issued the bearer as an ScJwtToken cookie
-        # from this endpoint. Harmless to try, and it keeps the integration working if
-        # an account is still served by the old stack.
-        _, _, headers = await self._request(
+        await self._request(
             "GET",
             f"{CS2}/Account/LoginValidated/JwtToken",
             headers={
@@ -607,30 +581,37 @@ class GaPowerApi:
                 "Referer": f"{CS2}/Billing/Home",
             },
         )
-        jar = {c.key: c.value for c in self._session.cookie_jar}
-        self.jwt = self._cookie(headers, "ScJwtToken") or jar.get("ScJwtToken")
         if not self.jwt:
             raise GaPowerTransient(
-                "logged in, but found no bearer token for the occ* services - it was "
-                "not embedded in the portal page and no ScJwtToken was issued; the "
-                "page's token bootstrap has most likely moved"
+                "logged in, but no ScJwtToken header came back from "
+                "/Account/LoginValidated/JwtToken - the portal hands the bearer over "
+                "in a response header, so check whether that header was renamed"
             )
+        claims = _jwt_claims(self.jwt)
+        _LOGGER.debug(
+            "bearer acquired: len=%s iss=%s aud=%s claims=%s accounts_token=%s",
+            len(self.jwt), claims.get("iss"), claims.get("aud"), sorted(claims),
+            bool(self.accounts_jwt),
+        )
 
     # ------------------------------------------------------------------ data
 
     @property
     def _auth(self) -> dict[str, str]:
+        # Mirrors the SPA's request interceptor. Capital-B "Bearer" and the
+        # x-transaction-id prefix are copied from it verbatim rather than guessed.
         headers = {
             "Accept": "application/json, text/plain, */*",
-            "userid": self._username,
-            "devicetype": DEVICE_TYPE,
+            "UserId": self._username,
+            "DeviceType": DEVICE_TYPE,
+            "x-transaction-id": f"OCC_{uuid.uuid4()}",
             "Origin": CS2,
             "Referer": f"{CS2}/",
         }
-        # Omitted entirely rather than sent empty when no token was issued - the
-        # session cookie carries the request in that case.
         if self.jwt:
-            headers["Authorization"] = f"bearer {self.jwt}"
+            headers["Authorization"] = f"Bearer {self.jwt}"
+        if self.account_auth:
+            headers["account-authorization"] = self.account_auth
         return headers
 
     async def _get_json(self, url: str, label: str, **kw: Any) -> dict:
