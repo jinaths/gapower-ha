@@ -585,6 +585,17 @@ class GaPowerApi:
     async def _get_json(self, url: str, label: str, **kw: Any) -> dict:
         status, body, _ = await self._request("GET", url, headers=self._auth, **kw)
         if status in (401, 403):
+            # These services live on sibling hosts (occ*api.southerncompany.com), so
+            # what actually reaches them depends on cookie domain scope - log that
+            # alongside whatever the service says about the rejection.
+            _LOGGER.debug(
+                "%s auth rejected (%s): bearer=%s cookies_sent=%s body=%.300s",
+                label,
+                status,
+                "yes" if self.jwt else "no",
+                sorted(self._session.cookie_jar.filter_cookies(URL(url)).keys()),
+                body,
+            )
             # Force the next poll through a full login rather than reusing a session
             # the server has already rejected. Without this a stale session keeps
             # probing as live and the integration never recovers on its own.
