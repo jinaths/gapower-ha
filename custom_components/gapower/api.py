@@ -526,7 +526,7 @@ class GaPowerApi:
         so read the jar rather than the body. Session cookies from the relay are
         already attached by aiohttp.
         """
-        status, _, headers = await self._request(
+        status, body, headers = await self._request(
             "GET",
             f"{CS2}/Account/LoginValidated/JwtToken",
             headers={
@@ -534,37 +534,53 @@ class GaPowerApi:
                 "Referer": f"{CS2}/Billing/Home",
             },
         )
+        _LOGGER.debug(
+            "jwt endpoint: status=%s set-cookie=%s body=%.200s",
+            status,
+            [c.split("=")[0].strip() for c in headers.get("Set-Cookie", [])],
+            body,
+        )
         # Status matters as much as the cookie. A dead session answers with a redirect
-        # to the login page while a stale ScJwtToken may still be sitting in the jar -
+        # to the login page while a stale token may still be sitting in the jar -
         # without this check that combination probes as a live session forever.
         if status != 200:
             raise GaPowerTransient(
                 f"JwtToken endpoint returned HTTP {status} - no valid portal session"
             )
-        self.jwt = self._cookie(headers, "ScJwtToken")
+
+        jar = {c.key: c.value for c in self._session.cookie_jar}
+        # Post-migration this endpoint answers 200 with `"Data": null` and, at least on
+        # this account, issues no ScJwtToken at all - the browser capture showed the
+        # same. So treat it as best-effort and fall back to the portal session cookie
+        # that /Account/LoginComplete actually sets. The occ* services reply with
+        # access-control-allow-credentials, i.e. they accept the session cookie; the
+        # bearer header is belt-and-braces on top of it.
+        self.jwt = (
+            self._cookie(headers, "ScJwtToken")
+            or jar.get("ScJwtToken")
+            or jar.get("SouthernJwtCookie")
+        )
         if not self.jwt:
-            for cookie in self._session.cookie_jar:
-                if cookie.key == "ScJwtToken":
-                    self.jwt = cookie.value
-                    break
-        if not self.jwt:
-            raise GaPowerTransient(
-                f"ScJwtToken missing after login (HTTP {status}) - the portal session "
-                "did not take, so the relay completed without authenticating"
-            )
+            # Not fatal by itself. If the session really is bad, the first data call
+            # returns 401/403 and reports it precisely, rather than this guessing.
+            _LOGGER.debug("no bearer token available; relying on session cookies alone")
 
     # ------------------------------------------------------------------ data
 
     @property
     def _auth(self) -> dict[str, str]:
-        return {
-            "Authorization": f"bearer {self.jwt}",
+        headers = {
             "Accept": "application/json, text/plain, */*",
             "userid": self._username,
             "devicetype": DEVICE_TYPE,
             "Origin": CS2,
             "Referer": f"{CS2}/",
         }
+        # Omitted entirely rather than sent empty when no token was issued - the
+        # session cookie carries the request in that case.
+        if self.jwt:
+            headers["Authorization"] = f"bearer {self.jwt}"
+        return headers
 
     async def _get_json(self, url: str, label: str, **kw: Any) -> dict:
         status, body, _ = await self._request("GET", url, headers=self._auth, **kw)
