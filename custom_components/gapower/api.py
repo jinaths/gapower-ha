@@ -526,7 +526,33 @@ class GaPowerApi:
         so read the jar rather than the body. Session cookies from the relay are
         already attached by aiohttp.
         """
-        status, body, headers = await self._request(
+        # The bearer comes out of the authenticated portal page, not from
+        # /Account/LoginValidated/JwtToken. That endpoint answers 200 with
+        # `"Data": null` and sets no cookie (verified in the log and in a browser
+        # capture), and the page's own scripts were already calling the occ* services
+        # before it ran - so it cannot be the source. The session cookie is no help
+        # either: it is host-only on customerservice2 and is never sent to the
+        # occ*api.southerncompany.com siblings, which is exactly why they answered 401.
+        status, body, _ = await self._request(
+            "GET", f"{CS2}/Billing/Home", headers={"Referer": f"{CS2}/"}
+        )
+        if status != 200:
+            raise GaPowerTransient(
+                f"portal page returned HTTP {status} after login - no valid session"
+            )
+        m = re.search(r"eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}", body)
+        _LOGGER.debug(
+            "portal page: %s bytes, embedded jwt %s",
+            len(body),
+            "found" if m else "NOT found",
+        )
+        if m:
+            self.jwt = m.group(0)
+            return
+        # Legacy fallback: older deployments issued the bearer as an ScJwtToken cookie
+        # from this endpoint. Harmless to try, and it keeps the integration working if
+        # an account is still served by the old stack.
+        _, _, headers = await self._request(
             "GET",
             f"{CS2}/Account/LoginValidated/JwtToken",
             headers={
@@ -534,36 +560,14 @@ class GaPowerApi:
                 "Referer": f"{CS2}/Billing/Home",
             },
         )
-        _LOGGER.debug(
-            "jwt endpoint: status=%s set-cookie=%s body=%.200s",
-            status,
-            [c.split("=")[0].strip() for c in headers.get("Set-Cookie", [])],
-            body,
-        )
-        # Status matters as much as the cookie. A dead session answers with a redirect
-        # to the login page while a stale token may still be sitting in the jar -
-        # without this check that combination probes as a live session forever.
-        if status != 200:
-            raise GaPowerTransient(
-                f"JwtToken endpoint returned HTTP {status} - no valid portal session"
-            )
-
         jar = {c.key: c.value for c in self._session.cookie_jar}
-        # Post-migration this endpoint answers 200 with `"Data": null` and, at least on
-        # this account, issues no ScJwtToken at all - the browser capture showed the
-        # same. So treat it as best-effort and fall back to the portal session cookie
-        # that /Account/LoginComplete actually sets. The occ* services reply with
-        # access-control-allow-credentials, i.e. they accept the session cookie; the
-        # bearer header is belt-and-braces on top of it.
-        self.jwt = (
-            self._cookie(headers, "ScJwtToken")
-            or jar.get("ScJwtToken")
-            or jar.get("SouthernJwtCookie")
-        )
+        self.jwt = self._cookie(headers, "ScJwtToken") or jar.get("ScJwtToken")
         if not self.jwt:
-            # Not fatal by itself. If the session really is bad, the first data call
-            # returns 401/403 and reports it precisely, rather than this guessing.
-            _LOGGER.debug("no bearer token available; relying on session cookies alone")
+            raise GaPowerTransient(
+                "logged in, but found no bearer token for the occ* services - it was "
+                "not embedded in the portal page and no ScJwtToken was issued; the "
+                "page's token bootstrap has most likely moved"
+            )
 
     # ------------------------------------------------------------------ data
 
