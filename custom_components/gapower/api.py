@@ -30,6 +30,7 @@ endpoint in the 2026-09-08 capture.
 from __future__ import annotations
 
 import asyncio
+import base64
 import datetime as dt
 import json
 import logging
@@ -161,8 +162,6 @@ def _looks_like_bot_challenge(status: int, body: str, content_type: str) -> bool
     if status in (401, 403, 405, 406, 503):
         if any(m in low for m in IMPERVA_MARKERS_WEAK):
             return True
-        if status == 403 and len(body or "") < 256:
-            return True
     return False
 
 
@@ -170,6 +169,57 @@ def _attr(tag: str, name: str) -> str | None:
     """Read one HTML attribute, tolerating either quote style and loose spacing."""
     m = re.search(rf"""{name}\s*=\s*["']([^"']*)["']""", tag, re.I)
     return m.group(1) if m else None
+
+
+# The portal page embeds several JWT-shaped strings: Dynatrace's RUM config and
+# Imperva's client SDK both carry lookalikes, so taking the first match is a coin flip.
+_BEARER_DECOYS = ("dtconfig", "ruxit", "dynatrace", "incapsula", "reese84", "_incapsula_")
+_BEARER_HINTS = ("jwt", "bearer", "accesstoken", "access_token", "token", "authorization")
+
+
+def _jwt_claims(token: str) -> dict[str, Any]:
+    """Decode a JWT payload without verifying it. {} if it is not readable."""
+    try:
+        payload = token.split(".")[1]
+        payload += "=" * (-len(payload) % 4)
+        return json.loads(base64.urlsafe_b64decode(payload))
+    except Exception:  # noqa: BLE001 - a malformed segment just means "not a JWT"
+        return {}
+
+
+def _pick_bearer(body: str) -> str | None:
+    """Choose the occ* API bearer from the JWTs embedded in the authenticated page.
+
+    Scored rather than positional: the assignment it sits on and its own claims are
+    what separate the real bearer from the analytics and WAF lookalikes beside it.
+    """
+    best: tuple[int, str] | None = None
+    for m in re.finditer(
+        r"eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}", body
+    ):
+        token = m.group(0)
+        context = body[max(0, m.start() - 80) : m.start()].lower()
+        claims = _jwt_claims(token)
+
+        score = 0
+        if any(h in context for h in _BEARER_HINTS):
+            score += 3
+        if any(d in context for d in _BEARER_DECOYS):
+            score -= 6
+        origin = (str(claims.get("iss", "")) + str(claims.get("aud", ""))).lower()
+        if "southern" in origin or "occ" in origin:
+            score += 3
+        if claims:
+            score += 1
+        # Names and claim keys only - never a token or claim value.
+        _LOGGER.debug(
+            "bearer candidate: score=%s len=%s after=%r claims=%s iss=%s aud=%s",
+            score, len(token), context[-40:].strip(), sorted(claims),
+            claims.get("iss"), claims.get("aud"),
+        )
+        if best is None or score > best[0]:
+            best = (score, token)
+    return best[1] if best else None
 
 
 def _form_post_target(body: str, base: str) -> tuple[str, dict[str, str]] | None:
@@ -522,8 +572,7 @@ class GaPowerApi:
     async def _fetch_jwt(self) -> None:
         """Collect the bearer token the occ* services want.
 
-        The endpoint answers 200 with `Data: null` and delivers the token as a cookie,
-        so read the jar rather than the body. Session cookies from the relay are
+        Read out of the authenticated portal page. Session cookies from the relay are
         already attached by aiohttp.
         """
         # The bearer comes out of the authenticated portal page, not from
@@ -540,14 +589,12 @@ class GaPowerApi:
             raise GaPowerTransient(
                 f"portal page returned HTTP {status} after login - no valid session"
             )
-        m = re.search(r"eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}", body)
+        token = _pick_bearer(body)
         _LOGGER.debug(
-            "portal page: %s bytes, embedded jwt %s",
-            len(body),
-            "found" if m else "NOT found",
+            "portal page: %s bytes, bearer %s", len(body), "selected" if token else "NOT found"
         )
-        if m:
-            self.jwt = m.group(0)
+        if token:
+            self.jwt = token
             return
         # Legacy fallback: older deployments issued the bearer as an ScJwtToken cookie
         # from this endpoint. Harmless to try, and it keeps the integration working if
