@@ -36,9 +36,10 @@ import logging
 import random
 import re
 from typing import Any
-from urllib.parse import urljoin, urlparse
+from urllib.parse import urlencode, urljoin, urlparse
 
 import aiohttp
+from yarl import URL
 
 from .const import CHUNK_DAYS, SENTINEL
 
@@ -53,6 +54,23 @@ USAGE_API = "https://occmypowerusageapi.southerncompany.com/api/v1"
 # ForgeRock realm path and the authentication tree the portal uses.
 AM_AUTH_PATH = "/am/json/realms/root/realms/alpha/authenticate"
 AM_SERVICE = "occSecureLogin"
+
+# Where webauth issues the OIDC challenge that starts a login.
+WEBAUTH_OIDC_INIT = f"{WEBAUTH}/SPA/ExternalAuthentication/forgerock-oidc-authcode"
+
+# Copied verbatim from a real browser navigation. ALL SEVEN are required: dropping
+# WL_CancelUrl or originalPath makes webauth answer 500 instead of redirecting to
+# ForgeRock (confirmed by probing both variants, 2026-09-08). WL_ReturnUrl keeps
+# %2FBilling%2FHome encoded because it is a query value inside a nested URL.
+OIDC_INIT_PARAMS = {
+    "WL_ReturnUrl": f"{CS2}/Account/LoginComplete?returnUrl=%2FBilling%2FHome",
+    "WL_AppId": "pr-occ-forgerock",
+    "WL_Type": "E",
+    "BrowserContextTarget": "Top",
+    "WL_CancelUrl": f"{CS2}/Account/Login",
+    "Company": "GPC",
+    "originalPath": "/OCC/login",
+}
 
 # ForgeRock rejects the callback protocol without these two. The SDK marker also keeps
 # us on the JSON API rather than AM's own hosted login UI.
@@ -304,33 +322,41 @@ class GaPowerApi:
         await self._fetch_jwt()
 
     async def _discover_authorize_url(self) -> str:
-        """Follow the unauthenticated redirect chain until AM's authorize endpoint."""
-        url = f"{CS2}/Billing/Home"
-        for _ in range(MAX_REDIRECTS):
-            status, body, headers = await self._request("GET", url)
-            if status in (301, 302, 303, 307, 308):
-                location = headers["Location"]
-                if not location:
-                    raise GaPowerTransient(f"redirect from {url} carried no Location")
-                url = urljoin(url, location)
-                if "/am/oauth2/authorize" in url:
-                    return url
-                continue
+        """Ask webauth to issue a fresh OIDC challenge and return its authorize URL.
 
-            # Not a redirect. Some hops hand the authorize URL over in the page - either
-            # as a form target or embedded in a `goto` parameter on the login SPA's URL.
-            if status == 200:
-                m = re.search(
-                    r"https?://[^\"'\s]*?/am/oauth2/authorize[^\"'\s]*", body
-                )
-                if m:
-                    return m.group(0).replace("&amp;", "&")
+        Crawling /Billing/Home for this does not work: that route answers 200 with the
+        Angular shell (a spinner plus the Imperva and Dynatrace agents) and performs the
+        login redirect in client-side JavaScript, so the authorize URL never appears in
+        any HTML we can see. Calling webauth's initiation endpoint directly is what
+        produces it - verified 2026-09-08, it 302s straight to
+        customerlogin/am/oauth2/authorize.
+
+        The challenge carries a `state` and PKCE `code_challenge` that webauth mints and
+        then validates on the way back, alongside a correlation cookie set on this very
+        response. Both are why the request has to originate here rather than be
+        assembled by us.
+        """
+        # Pre-encoded on purpose: WL_ReturnUrl nests a URL that itself carries an
+        # encoded query, and it must reach webauth double-encoded. Handing the string
+        # to yarl for encoding is not reliable here - it can treat the existing %2F as
+        # already-encoded and pass it through - so build the query and mark it final.
+        url = URL(f"{WEBAUTH_OIDC_INIT}?{urlencode(OIDC_INIT_PARAMS)}", encoded=True)
+        status, _, headers = await self._request("GET", url)
+
+        if status not in (301, 302, 303, 307, 308):
             raise GaPowerTransient(
-                f"could not reach the ForgeRock authorize endpoint (stopped at "
-                f"{urlparse(url).path} with HTTP {status}) - the login flow may have "
-                "changed again; capture a browser HAR and compare"
+                f"login initiation returned HTTP {status}, expected a redirect - "
+                "webauth answers 500 when a required parameter is missing, so the "
+                "portal's login parameters have most likely changed; capture a browser "
+                "HAR from a logged-out state and compare OIDC_INIT_PARAMS"
             )
-        raise GaPowerTransient("too many redirects looking for the authorize endpoint")
+        location = headers["Location"]
+        if "/am/oauth2/authorize" not in location:
+            raise GaPowerTransient(
+                "login initiation redirected somewhere unexpected: "
+                f"{urlparse(location).netloc}{urlparse(location).path}"
+            )
+        return urljoin(str(url), location)
 
     async def _forgerock_authenticate(self) -> None:
         """Two-step callback exchange against AM; leaves a session cookie in the jar."""
