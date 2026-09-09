@@ -460,9 +460,24 @@ class GaPowerApi:
         """
         url, method, data = authorize_url, "GET", None
 
-        for _ in range(MAX_REDIRECTS):
+        for hop in range(MAX_REDIRECTS):
             kw: dict[str, Any] = {"data": data} if data else {}
             status, body, headers = await self._request(method, url, **kw)
+            # The relay is several opaque hops and only its final symptom is visible
+            # in the config entry, so trace each one. Names only - no token values.
+            _LOGGER.debug(
+                "relay hop %s: %s %s%s -> %s%s | set-cookie=%s | jar=%s",
+                hop,
+                method,
+                urlparse(url).netloc,
+                urlparse(url).path,
+                status,
+                " -> " + urlparse(headers["Location"]).path
+                if headers.get("Location")
+                else "",
+                [c.split("=")[0].strip() for c in headers.get("Set-Cookie", [])],
+                sorted({c.key for c in self._session.cookie_jar}),
+            )
 
             if status in (301, 302, 303, 307, 308):
                 location = headers["Location"]
@@ -483,6 +498,14 @@ class GaPowerApi:
                 raise GaPowerTransient(f"login relay: HTTP {status} from {url.split('?')[0]}")
 
             target = _form_post_target(body, url)
+            if target is not None:
+                _LOGGER.debug(
+                    "relay hop %s: form -> %s%s fields=%s",
+                    hop,
+                    urlparse(target[0]).netloc,
+                    urlparse(target[0]).path,
+                    sorted(target[1]),
+                )
             if target is None:
                 if LOADING_SHELL in body[:4000].lower():
                     raise GaPowerBotDetected(
