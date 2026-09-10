@@ -81,7 +81,10 @@ async def async_setup_entry(
     """Set up the diagnostic sensors."""
     coordinator = entry.runtime_data
     async_add_entities(
-        GaPowerSensor(coordinator, entry, description) for description in SENSORS
+        [
+            *(GaPowerSensor(coordinator, entry, d) for d in SENSORS),
+            GaPowerStatusSensor(coordinator, entry),
+        ]
     )
 
 
@@ -121,3 +124,54 @@ class GaPowerSensor(CoordinatorEntity[GaPowerCoordinator], SensorEntity):
         if self.entity_description.device_class is SensorDeviceClass.MONETARY:
             return self.hass.config.currency
         return self.entity_description.native_unit_of_measurement
+
+
+class GaPowerStatusSensor(CoordinatorEntity[GaPowerCoordinator], SensorEntity):
+    """Whether the integration is working, and if not, what stopped it.
+
+    Deliberately always available. Every other entity here reports a value from the
+    last poll, so all of them go unavailable the moment a poll fails - which is
+    exactly the moment something needs to be able to explain itself. An automation
+    watching only those can say "unavailable" and nothing more, which is what the
+    first version of the staleness alert did. This one stays up and names the cause.
+    """
+
+    _attr_has_entity_name = True
+    _attr_translation_key = "status"
+    _attr_entity_category = EntityCategory.DIAGNOSTIC
+    _attr_device_class = SensorDeviceClass.ENUM
+    _attr_options = ["ok", "invalid_auth", "utility_outage", "blocked", "error"]
+
+    def __init__(
+        self, coordinator: GaPowerCoordinator, entry: GaPowerConfigEntry
+    ) -> None:
+        super().__init__(coordinator)
+        self._attr_unique_id = f"{entry.entry_id}_status"
+        self._attr_device_info = DeviceInfo(
+            identifiers={(DOMAIN, entry.entry_id)},
+            name="Georgia Power",
+            manufacturer="Southern Company",
+            entry_type=DeviceEntryType.SERVICE,
+        )
+
+    @property
+    def available(self) -> bool:
+        """Always. The whole point of this entity is to survive a failed poll."""
+        return True
+
+    @property
+    def native_value(self) -> str:
+        if self.coordinator.last_update_success:
+            return "ok"
+        # A failure classified before the first successful poll may not have been
+        # recorded yet (setup can fail outside _async_update_data), so fall back
+        # rather than reporting an option that isn't in the list.
+        return self.coordinator.last_error_kind or "error"
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        failing = not self.coordinator.last_update_success
+        return {
+            "last_error": self.coordinator.last_error if failing else None,
+            "last_success": self.coordinator.last_success,
+        }

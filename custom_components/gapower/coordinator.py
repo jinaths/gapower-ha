@@ -32,6 +32,8 @@ from .api import (
     GaPowerAuthError,
     GaPowerBotDetected,
     GaPowerError,
+    GaPowerMaintenance,
+    GaPowerSessionExpired,
     GaPowerTransient,
 )
 from .const import BACKFILL_DAYS, DOMAIN, REFETCH_DAYS, UPDATE_INTERVAL
@@ -71,6 +73,13 @@ class GaPowerCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             entry.data[CONF_USERNAME],
             entry.data[CONF_PASSWORD],
         )
+        # Why the last poll failed, kept here rather than in the coordinator's data.
+        # Every entity fed by `data` goes unavailable the instant a poll fails, taking
+        # its attributes with it - which is precisely the moment something needs to be
+        # able to say what broke. The status sensor reads these instead.
+        self.last_error: str | None = None
+        self.last_error_kind: str | None = None
+        self.last_success: dt.datetime | None = None
 
     @property
     def _usage_id(self) -> str:
@@ -82,20 +91,51 @@ class GaPowerCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
     async def _async_update_data(self) -> dict[str, Any]:
         try:
-            await self.api.login()
-            await self.api.resolve_account()
-            return await self._async_import_statistics()
+            try:
+                data = await self._async_poll()
+            except GaPowerSessionExpired as err:
+                # The session died between polls or part-way through this one.
+                # Deferring to the next scheduled run would cost 12 hours of data for
+                # something a single login fixes, so re-authenticate and go again -
+                # once. A second failure falls through to the handlers below, so a
+                # genuinely rejected account can never become a retry loop against
+                # the utility.
+                self.logger.debug("Session rejected (%s); re-authenticating once", err)
+                await self.api.force_relogin()
+                data = await self._async_poll()
         except GaPowerAuthError as err:
             # Triggers HA's reauth flow rather than retrying - repeated bad logins
             # risk locking the utility account.
-            raise ConfigEntryAuthFailed(str(err)) from err
+            raise ConfigEntryAuthFailed(self._record("invalid_auth", err)) from err
+        except GaPowerMaintenance as err:
+            raise UpdateFailed(self._record("utility_outage", err)) from err
         except GaPowerBotDetected as err:
             raise UpdateFailed(
-                f"{err}. Southern Company's WAF is challenging us; this usually "
-                "clears within ~30 minutes."
+                self._record(
+                    "blocked",
+                    f"{err}. Southern Company's WAF is challenging us; this usually "
+                    "clears within ~30 minutes.",
+                )
             ) from err
         except (GaPowerTransient, GaPowerError) as err:
-            raise UpdateFailed(str(err)) from err
+            raise UpdateFailed(self._record("error", err)) from err
+
+        self.last_error = None
+        self.last_error_kind = None
+        self.last_success = dt.datetime.now(dt.timezone.utc)
+        return data
+
+    async def _async_poll(self) -> dict[str, Any]:
+        """One full pass: authenticate, resolve the account, import the statistics."""
+        await self.api.login()
+        await self.api.resolve_account()
+        return await self._async_import_statistics()
+
+    def _record(self, kind: str, err: object) -> str:
+        """Remember why a poll failed, and hand back the message to raise with."""
+        self.last_error_kind = kind
+        self.last_error = str(err)
+        return self.last_error
 
     async def _async_get_last(self, statistic_id: str) -> dict | None:
         last = await get_instance(self.hass).async_add_executor_job(

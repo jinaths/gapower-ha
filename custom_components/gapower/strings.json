@@ -40,6 +40,16 @@
       },
       "imported_rows": {
         "name": "Rows imported"
+      },
+      "status": {
+        "name": "Status",
+        "state": {
+          "ok": "OK",
+          "invalid_auth": "Credentials rejected",
+          "utility_outage": "Utility outage",
+          "blocked": "Blocked by bot protection",
+          "error": "Error"
+        }
       }
     }
   }

@@ -153,6 +153,15 @@ class GaPowerTransient(GaPowerError):
     """Network blip, 5xx, or 429. Safe to retry later."""
 
 
+class GaPowerSessionExpired(GaPowerTransient):
+    """The portal rejected the session we were reusing.
+
+    A subclass of GaPowerTransient, so every existing `except GaPowerTransient`
+    still catches it. The distinct type exists only so the coordinator can tell
+    "come back later" apart from "log in again and retry right now".
+    """
+
+
 class GaPowerMaintenance(GaPowerError):
     """Utility-side planned outage. Nothing to fix here; resolves on its own."""
 
@@ -367,11 +376,22 @@ class GaPowerApi:
         """
         if not self._token_valid_for():
             return False
+        # Drop the held token before probing. /Billing/Home answers 200 whether or
+        # not anyone is signed in (confirmed with an unauthenticated curl), and
+        # _fetch_jwt's only other check is `if not self.jwt` - which a token left
+        # over from the previous poll satisfies for free. Between them the probe
+        # could not fail, so a session the server had already dropped still read as
+        # live and every request after it was doomed. Clearing first makes the probe
+        # demand a freshly harvested ScJwtToken, which only a live session sends.
+        self.jwt = None
+        self._soft_auth = False
         try:
             await self._fetch_jwt()
         except GaPowerTransient:
             return False
-        return True
+        # A soft-auth token means the portal recognises the browser but not the
+        # session; the occ* services will not accept it. Log in properly.
+        return not self._soft_auth
 
     async def login(self) -> None:
         """ForgeRock OIDC login. Raises GaPowerAuthError on bad credentials.
@@ -389,7 +409,15 @@ class GaPowerApi:
         # propagate out of the probe - those mean stop, not try harder.
         if await self._session_is_live():
             return
+        await self.force_relogin()
 
+    async def force_relogin(self) -> None:
+        """Authenticate from scratch, without consulting the current session.
+
+        `login` reuses a session it believes is still good. When the portal has just
+        told us otherwise mid-poll, that belief is the thing at fault - so the
+        recovery path has to bypass it rather than ask again.
+        """
         self._reset_session()
         authorize_url = await self._discover_authorize_url()
         await self._forgerock_authenticate()
@@ -649,7 +677,9 @@ class GaPowerApi:
         return headers
 
     async def _get_json(self, url: str, label: str, **kw: Any) -> dict:
-        status, body, _ = await self._request("GET", url, headers=self._auth, **kw)
+        status, body, headers = await self._request(
+            "GET", url, headers=self._auth, **kw
+        )
         if status in (401, 403):
             # These services live on sibling hosts (occ*api.southerncompany.com), so
             # what actually reaches them depends on cookie domain scope - log that
@@ -666,7 +696,23 @@ class GaPowerApi:
             # the server has already rejected. Without this a stale session keeps
             # probing as live and the integration never recovers on its own.
             self._reset_session()
-            raise GaPowerTransient(f"{label}: HTTP {status} - session expired")
+            raise GaPowerSessionExpired(f"{label}: HTTP {status} - session expired")
+        if status in (301, 302, 303, 307, 308):
+            # A JSON API does not redirect a request it is willing to answer. These
+            # hosts turn away a stale bearer by sending the browser back to the login
+            # flow rather than by returning 401, so this is a session rejection
+            # wearing a different number. It used to fall through to the generic
+            # non-200 branch below, which left the dead session in place to be reused
+            # on every subsequent poll - observed 2026-09-10 as a 302 on
+            # UsageGraphData/Hourly that stuck for a full 12h cycle.
+            _LOGGER.debug(
+                "%s redirected (%s) to %s - treating as a session rejection",
+                label,
+                status,
+                urlparse(headers.get("Location") or "").path or "?",
+            )
+            self._reset_session()
+            raise GaPowerSessionExpired(f"{label}: HTTP {status} - session rejected")
         if status != 200:
             raise GaPowerTransient(f"{label}: HTTP {status}")
         try:
