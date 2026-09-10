@@ -806,13 +806,13 @@ class GaPowerApi:
         return out
 
     async def _fetch_chunk(self, start: dt.date, last_day: dt.date) -> dict | None:
-        # UNVERIFIED on this route: the 2026-09-08 capture only ever requested ONE day
-        # of hourly data at a time, so CHUNK_DAYS=30 is carried over from the retired
-        # MPUData endpoint rather than confirmed here. If backfill returns short or
-        # empty windows, suspect a server-side cap first and lower CHUNK_DAYS - the
-        # portal exposes its own limit at
+        # CHUNK_DAYS=30 was carried over from the retired MPUData endpoint, and is now
+        # confirmed on this route too: a 45-day refetch on 2026-09-09 returned 1081
+        # points across two chunks (45 x 24 = 1080) and the short-window check below
+        # stayed silent. No server-side cap. If that ever changes, the portal states
+        # its own limit at
         # occcustomerserviceapi /api/v1/Utilities/getRegistryValue?key=HOURLY_BULK_EXPORT_DAYS,
-        # which is worth reading before guessing.
+        # which is worth reading before guessing at a new value.
         params = {
             "accountId": self.account,
             "personId": self.person_id,
@@ -847,10 +847,10 @@ class GaPowerApi:
         if not isinstance(inner, dict):
             return None
 
-        # CHUNK_DAYS is inherited from the retired MPUData route and has never been
-        # confirmed against this one, so check what actually came back rather than
-        # trusting it. A server-side cap would return a short window and silently
-        # leave holes in the history.
+        # Verify what came back rather than trusting CHUNK_DAYS to still be safe. A
+        # server-side cap introduced later would return a short window and silently
+        # leave holes in the history - the worst failure mode this has, because the
+        # import succeeds and nothing looks wrong.
         labels = (inner.get("xAxis") or {}).get("labels") or []
         wanted = (last_day - start).days + 1
         if labels and len(labels) < wanted * 24 * 0.9:

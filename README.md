@@ -9,18 +9,13 @@ cron, no separate Python environment.
 - Native config flow, and a reauth prompt if the credentials stop working
 - **Zero PyPI dependencies** — uses `aiohttp`, which HA already ships
 
-> ## ⚠️ Status: BROKEN as of 2026-09-08 — auth rewrite in progress
+> ## Status: working
 >
 > Southern Company's Aug 31 – Sep 8 2026 CIS migration **replaced the entire login
-> system** with ForgeRock/PingAM OIDC, and moved the usage API to new hosts. The
-> four-hop token relay this integration uses still returns `200`s but no longer
-> produces a valid session, so logins fail at `login step 4: ScJwtToken missing`.
->
-> This needs a rewrite of the auth chain and the data client, not a patch. See
-> [2026-09 migration](#2026-09-southern-company-migration) below for the full
-> mapping of what changed. Existing statistics are safe, and because the
-> integration re-fetches `REFETCH_DAYS` (45) on every run, the outage gap
-> backfills automatically once auth works again.
+> system** with ForgeRock/PingAM OIDC and moved the usage API to new hosts. The auth
+> chain and data client were rewritten for it and have been running since
+> 2026-09-08 — see [2026-09 migration](#2026-09-southern-company-migration) for the
+> full mapping of what changed and why the old flow could not be patched.
 
 ## Why not `southern-company-hacs`?
 
@@ -61,6 +56,12 @@ polls twice a day and imports only the last few hours.
 | `sensor.georgia_power_latest_hour_usage` | kWh in that hour |
 | `sensor.georgia_power_latest_hour_cost` | Cost of that hour |
 | `sensor.georgia_power_rows_imported` | Rows written on the last run (diagnostic) |
+| `sensor.georgia_power_status` | `ok` / `invalid_auth` / `utility_outage` / `blocked` / `error`, with the failure message on a `last_error` attribute |
+
+`status` is the only entity here that stays **available when a poll fails** — the
+others report values from the last successful run, so they all go `unavailable` at
+exactly the moment something needs to explain itself. Alert on the others; read
+`status` to find out why.
 
 ### Staleness alarm
 
@@ -70,13 +71,24 @@ A broken scraper looks identical to "no new data." Watch the timestamp:
 alias: Georgia Power data stale
 triggers:
   - trigger: template
+    # `ts is none` catches unknown/unavailable - total integration failure - which a
+    # bare subtraction misses, because now() - None raises and the trigger never fires.
     value_template: >
-      {{ (now() - states('sensor.georgia_power_last_reading')|as_datetime).total_seconds() > 172800 }}
+      {% set ts = states('sensor.georgia_power_last_reading') | as_datetime %}
+      {{ ts is none or (now() - ts).total_seconds() > 172800 }}
+    for: "01:00:00"
 actions:
   - action: notify.persistent_notification
     data:
-      message: Georgia Power usage data hasn't updated in over 48 hours.
+      message: >
+        Georgia Power: {{ states('sensor.georgia_power_status') }}.
+        {{ state_attr('sensor.georgia_power_status', 'last_error') }}
 ```
+
+Read `status` in the message rather than just reporting that the data sensor is
+`unavailable`. "Unavailable" is true of a wrong password, a utility outage, a WAF
+block and a network blip alike, and the difference decides whether there is
+anything for you to do.
 
 ## Expectations
 
@@ -94,6 +106,12 @@ actions:
   [2026-09 migration](#2026-09-southern-company-migration).
 - Bot protection (Imperva) can block requests from your IP for ~30 minutes. The integration backs
   off rather than hammering.
+- **Sessions are reused between polls, and the portal drops them without warning.** When it does,
+  the usage API answers with a `302` back to the login flow rather than a `401`. That is treated as
+  a session rejection: the integration re-authenticates and retries the poll once, so a dropped
+  session costs a few extra requests rather than the twelve hours until the next scheduled run.
+  It retries exactly once — a genuinely rejected account must never become a login loop against
+  the utility.
 
 ## 2026-09 Southern Company migration
 
