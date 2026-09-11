@@ -185,6 +185,43 @@ def _attr(tag: str, name: str) -> str | None:
     return m.group(1) if m else None
 
 
+_DATEISH = re.compile(r"^\d{1,4}[-/]\d{1,2}[-/]\d{1,4}([T ]|$)")
+
+
+def _probe(label: str, obj: Any) -> None:
+    """TEMPORARY (2026-09-10, phase 0 of demand-alert-plan.md): find the billing cycle.
+
+    CLAUDE.md records the cycle as coming from the portal's `billGroupPeriod`, but
+    nothing reads that field and no note says which response carries it. These
+    payloads are already fetched and mostly discarded, so this reads them at no
+    request cost. DELETE once the cycle's home is known.
+
+    Key names are always printed - they are what we are hunting for. Values are
+    printed only when they look like a date, plus bare numbers and booleans. Every
+    other string shows its length only, so account numbers, person ids and the
+    134-char DataProtection blobs never reach the log.
+    """
+    if not isinstance(obj, dict):
+        _LOGGER.info("PROBE %s: not a dict (%s)", label, type(obj).__name__)
+        return
+    out = []
+    for k in sorted(obj):
+        v = obj[k]
+        if isinstance(v, bool) or v is None or isinstance(v, (int, float)):
+            out.append(f"{k}={v}")
+        elif isinstance(v, str):
+            out.append(f"{k}={v!r}" if _DATEISH.match(v) else f"{k}=<str {len(v)}>")
+        elif isinstance(v, dict):
+            out.append(f"{k}={{{','.join(sorted(v))}}}")
+        elif isinstance(v, list):
+            first = v[0] if v else None
+            inner = f"[{','.join(sorted(first))}]" if isinstance(first, dict) else ""
+            out.append(f"{k}=<list {len(v)}>{inner}")
+        else:
+            out.append(f"{k}=<{type(v).__name__}>")
+    _LOGGER.info("PROBE %s: %s", label, " | ".join(out))
+
+
 def _exp_utc(claims: dict[str, Any]) -> dt.datetime | None:
     """The token's expiry as an aware UTC datetime, or None if it has none."""
     exp = claims.get("exp")
@@ -737,10 +774,12 @@ class GaPowerApi:
             return
 
         payload = await self._get_json(f"{ACCOUNT_API}/Cap/", "Cap")
+        _probe("Cap.envelope", payload)
         accounts = payload.get("data") or []
         if not accounts:
             raise GaPowerError("No accounts returned")
         acct = next((a for a in accounts if a.get("isPrimaryAccount")), accounts[0])
+        _probe("Cap.account", acct)
         self.account = str(acct.get("accountNumber") or "")
         self.company = acct.get("company") or "GPC"
         if not self.account:
@@ -749,7 +788,9 @@ class GaPowerApi:
         summary = await self._get_json(
             f"{ACCOUNT_API}/Accounts/{self.account}/Summary", "Accounts/Summary"
         )
+        _probe("Summary.envelope", summary)
         data = summary.get("data") or {}
+        _probe("Summary.data", data)
         self.person_id = data.get("mainPersonId")
 
         # Accounts can carry gas and other agreements alongside electric; only the
@@ -766,6 +807,7 @@ class GaPowerApi:
         if agreement is None:
             kinds = sorted({str(a.get("serviceTypeCode")) for a in agreements})
             raise GaPowerError(f"No active electric service agreement; found {kinds}")
+        _probe("Summary.agreement", agreement)
         self.service_agreement = agreement.get("serviceAgreementId")
         self.premise_id = agreement.get("premiseId")
 
@@ -832,7 +874,11 @@ class GaPowerApi:
             "UsageGraphData/Hourly",
             params=params,
         )
+        _probe("UsageGraphData.envelope", payload)
         data = payload.get("data") or {}
+        # These siblings of `inner` are discarded on every poll and are the most
+        # likely home for the billing period - they arrive with the usage itself.
+        _probe("UsageGraphData.data", data)
         if not data.get("hasData"):
             _LOGGER.debug("No hourly data for %s .. %s", start, last_day)
             return None
