@@ -1,10 +1,29 @@
 # Georgia Power for Home Assistant
 
-See your Georgia Power electricity use in Home Assistant's Energy Dashboard — **hour by hour**,
-with cost, going back a full year.
+**Hourly electricity usage and cost in Home Assistant's Energy Dashboard — for Georgia Power, and
+very likely Alabama Power and Mississippi Power too.**
 
-No extra hardware. No separate server or script to run. No add-ons. You enter your
-georgiapower.com login once, and Home Assistant does the rest.
+Hour by hour, with cost, going back a full year. No extra hardware, no separate server or script,
+no add-ons. You sign in once with your utility account and Home Assistant does the rest.
+
+> ## 🔌 Alabama Power and Mississippi Power customers — this should work for you
+>
+> Despite the name, **nothing in the login or the data path is Georgia-specific.** Southern Company
+> runs **one sign-in system for all of its operating companies**, and this talks to the shared
+> services behind it.
+>
+> Verified by probing the live endpoint on 2026-09-10: the operating-company parameter isn't
+> validated *at all* — Georgia, Alabama, Mississippi, a nonsense value and an empty string every
+> one return the same valid sign-in challenge. The company that actually matters is read from
+> **your own account** after you sign in, and passed through automatically.
+>
+> **It is untested on Alabama and Mississippi**, because I only have a Georgia Power account — but
+> there is no code path that turns them away. If you try it, please
+> [open an issue](https://github.com/jinaths/gapower-ha/issues) either way. **A confirmed "it
+> works" is worth as much to me as a bug report**, and I'll update this the day someone tells me.
+>
+> Gas service (Nicor) won't work — it isn't electric. See
+> [Other Southern Company utilities](#other-southern-company-utilities).
 
 ---
 
@@ -34,28 +53,29 @@ That's it.
 
 ### Other Southern Company utilities
 
-The name says Georgia Power, but **nothing in the login or the data path is actually
-Georgia-specific.** Southern Company runs one sign-in system for all of its operating companies,
-and this talks to the shared `southernco.com` / `southerncompany.com` services that sit behind it:
+The technical detail behind the callout at the top, for anyone who wants to check the reasoning
+rather than take my word for it:
 
-- The login was **verified operating-company agnostic** on 2026-09-10. The `Company` parameter the
-  browser sends is not validated at all — `GPC`, `APC`, `MPC`, a nonsense value and an empty
-  string all issue the same valid sign-in challenge.
-- The operating company that *does* matter is read from your own account after you sign in, and
-  passed through to the usage API automatically. Nothing is hardcoded.
-- It then picks your active **electric** service agreement.
+- **The login is operating-company agnostic**, verified 2026-09-10 by probing
+  `webauth.southernco.com/SPA/ExternalAuthentication/forgerock-oidc-authcode` unauthenticated.
+  The `Company` parameter a real browser sends — `GPC` — is **not validated**: `APC`, `MPC`,
+  `SCS`, a nonsense value and an empty string all return the same `302` to ForgeRock's authorize
+  endpoint with a fresh `state` + PKCE challenge. There is one realm for all operating companies.
+- **The operating company is read per-account**, not hardcoded. After sign-in, `resolve_account`
+  takes `company` off your own account record and passes it to the usage API as
+  `operatingCompany`.
+- **Service selection is generic** — it picks your first active **electric** service agreement by
+  `serviceTypeCode`, not by state.
+- Everything talks to the shared `southernco.com` / `southerncompany.com` hosts, which serve every
+  operating company.
 
-So **Alabama Power and Mississippi Power should work as-is.** I can't promise it, because I only
-have a Georgia Power account to test against — but there is no code path that would turn them
-away. If you try it, please open an issue either way; a confirmed "works" is worth as much as a
-bug report.
+**Nicor Gas will not work.** It's gas, not electric, so the electric-agreement filter finds
+nothing, and the portal handles gas differently anyway. Use
+[`southern-company-hacs`](https://github.com/Southern-Company-HA/southern-company-hacs) — it
+supports Nicor properly.
 
-**Nicor Gas will not work.** It's gas, not electric, and the portal handles it differently.
-Use [`southern-company-hacs`](https://github.com/Southern-Company-HA/southern-company-hacs) for
-gas — it supports Nicor properly.
-
-What stays Georgia-flavoured is only cosmetic: the integration is called "Georgia Power" and its
-sensors are named to match.
+What stays Georgia-flavoured is purely cosmetic: the integration is titled "Georgia Power" and its
+sensors are named to match. That's a label, not a restriction.
 
 ## Install
 
