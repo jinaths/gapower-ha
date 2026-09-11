@@ -32,6 +32,31 @@ You need:
 
 That's it.
 
+### Other Southern Company utilities
+
+The name says Georgia Power, but **nothing in the login or the data path is actually
+Georgia-specific.** Southern Company runs one sign-in system for all of its operating companies,
+and this talks to the shared `southernco.com` / `southerncompany.com` services that sit behind it:
+
+- The login was **verified operating-company agnostic** on 2026-09-10. The `Company` parameter the
+  browser sends is not validated at all — `GPC`, `APC`, `MPC`, a nonsense value and an empty
+  string all issue the same valid sign-in challenge.
+- The operating company that *does* matter is read from your own account after you sign in, and
+  passed through to the usage API automatically. Nothing is hardcoded.
+- It then picks your active **electric** service agreement.
+
+So **Alabama Power and Mississippi Power should work as-is.** I can't promise it, because I only
+have a Georgia Power account to test against — but there is no code path that would turn them
+away. If you try it, please open an issue either way; a confirmed "works" is worth as much as a
+bug report.
+
+**Nicor Gas will not work.** It's gas, not electric, and the portal handles it differently.
+Use [`southern-company-hacs`](https://github.com/Southern-Company-HA/southern-company-hacs) for
+gas — it supports Nicor properly.
+
+What stays Georgia-flavoured is only cosmetic: the integration is called "Georgia Power" and its
+sensors are named to match.
+
 ## Install
 
 ### With HACS (recommended)
@@ -124,69 +149,114 @@ looking at it.
 
 ---
 
-## How this compares to the alternatives
+## How this compares to the alternative
 
-**Snapshot taken 2026-09-10.** All of these are actively developed — check their repos before
-taking this table as current.
+**Snapshot: 2026-09-10.** Everything below was checked against their live repository and manifest
+that day, not from memory. They ship often — verify before relying on it.
 
-If you searched for this, you probably found some combination of four links. Two of those are
-the same repository, and two are developer libraries rather than something you can install:
+Searching for this turns up three other projects. Two of them are **developer libraries**, not
+something you can install into Home Assistant:
 
 | | What it actually is |
 |---|---|
-| [`apearson/southern-company-api`](https://github.com/apearson/southern-company-api) | A **Node.js library**. Not a Home Assistant integration — you'd have to build something with it. |
-| [`Southern-Company-HA/southern_company_api`](https://github.com/Southern-Company-HA/southern_company_api) | A **Python library**, published to PyPI. Also not an integration by itself. |
-| [`Southern-Company-HA/southern-company-hacs`](https://github.com/Southern-Company-HA/southern-company-hacs) | **The real alternative.** A Home Assistant integration that wraps the Python library above. |
-| [`Lash-L/southern-company-hacs`](https://github.com/Lash-L/southern-company-hacs) | **The same repository as the one above**, under its old name — GitHub redirects it. Not a separate option. |
+| [`apearson/southern-company-api`](https://github.com/apearson/southern-company-api) | A **Node.js library**. You'd have to build something with it. It worked the original login chain out first, and this project's pre-migration flow was ported from it. |
+| [`Southern-Company-HA/southern_company_api`](https://github.com/Southern-Company-HA/southern_company_api) | A **Python library** on PyPI. Not an integration by itself — it's the engine the one below runs on. |
+| [`Southern-Company-HA/southern-company-hacs`](https://github.com/Southern-Company-HA/southern-company-hacs) | **The real alternative.** A Home Assistant integration wrapping the library above. |
 
-So for a Home Assistant user there is really one alternative. Here is an honest comparison —
-limited to things I actually verified, because I have not read their code closely enough to tell
-you what it lacks:
+So there is one genuine alternative, and it is good. Here is the honest head-to-head.
+
+### Side by side
 
 | | southern-company-hacs | this |
 |---|---|---|
-| Utilities covered | Georgia, Alabama, Mississippi Power, Nicor Gas | **Georgia Power only** |
-| Python dependencies | a pinned PyPI library (`southern-company-api`) | **none** — `requirements: []`, uses what Home Assistant already ships |
-| What HACS installs by default | newest tagged release: `1.0.0`, Aug 2024 | this repo's default branch |
-| Users | 34 stars, years of real-world use | new, essentially untested by anyone but me |
+| Utilities | Georgia, Alabama, Mississippi Power, **+ Nicor Gas** | Southern Company electric (Georgia tested) |
+| Multiple accounts on one login | **yes** | no — one per config entry |
+| Sensors | **~20** — projected bill high/low, average daily cost & usage, days used, outdoor temp, meter-read type, gas therms | 5, one of which reports *why* it broke |
+| Daily fallback if hourly is unavailable | **yes** | no — hourly or nothing |
+| Python dependencies | `southern-company-api==0.7.1` (pinned) | **none** — `requirements: []` |
+| Poll interval | every **60 minutes** | every **12 hours** |
+| History re-read each run | **31 days** | **45 days** |
+| Maturity | 34 stars, `quality_scale: bronze`, years of use | new, essentially untested by anyone but me |
 
-**Pick theirs if** you're not in Georgia, you have Nicor Gas, or you want the option with more
-people behind it and more eyes on it. For most readers that is the right answer, and I'd rather
-say so than pretend otherwise.
+### Why you might pick this one
 
-**Pick this if** you're a Georgia Power customer specifically after hourly data, and would rather
-maintain one self-contained thing than an integration plus a separately-versioned library.
+Four concrete reasons, not vibes:
 
-### What this one does differently
+**1. The 45-day re-read is a correctness fix, not a bigger number.**
 
-Stated as what it does, not as what anything else doesn't:
+This is the one that actually matters, and it is subtle. Georgia Power shows unbilled hours at an
+energy-only rate near **$0.056/kWh**, then restates those same hours at the full rate — roughly
+**three times higher** — once the billing cycle closes. An integration only captures that
+correction if it re-reads far enough back to cross the cycle boundary.
 
-- **No dependencies at all.** One folder, `aiohttp`, done. Nothing to version-pin, nothing that can
-  break because a shared library shifted underneath it.
-- **A status sensor that stays available when an update fails**, reporting `ok` / `invalid_auth` /
-  `utility_outage` / `blocked` / `error` with the message attached. Every other sensor here reports
-  the last good run, so they all go `unavailable` at exactly the moment you need an explanation.
-- **A rejected session re-authenticates and retries immediately** rather than waiting out the
-  twelve hours to the next scheduled update — once, never in a loop, because repeated failed
-  logins risk locking a utility account.
-- **Re-reads 45 days every run**, so Georgia Power's retroactive cost corrections actually land
-  instead of freezing at the provisional rate.
-- **Refuses to guess.** Where this can't tell a real value from a placeholder, it imports nothing
-  rather than importing something wrong.
+Georgia Power bill cycles are **meter-read driven, not calendar driven**. Seven consecutive real
+cycles measured **29, 30, 30, 31, 32 and 32 days**. A **31-day** window is *shorter than some
+cycles*. When a 32-day cycle closes, the oldest hours in it fall outside a 31-day re-read — so
+their cost never gets corrected, and stays understated in your Energy Dashboard permanently.
 
-### Credit, and a caveat about this whole section
+45 days clears the longest observed cycle with room to spare. Usage in kWh is unaffected either
+way; this is purely about the dollars being right.
 
-- **`apearson/southern-company-api` worked the login chain out first**, and this project's
-  pre-migration flow was ported from it. That's where the hard part came from.
-- **Both Python projects above shipped fixes for the September 2026 Georgia Power login change on
-  the same day this was written.** They are actively maintained. The tagged-release row is a real
-  difference for HACS users *today* and is one `git tag` away from being wrong.
-- An earlier draft of this table claimed their hourly path was broken on residential accounts,
-  citing [issue #124](https://github.com/Southern-Company-HA/southern-company-hacs/issues/124).
-  **That issue is closed and appears to have been fixed in August 2026.** Left here as a note
-  because a comparison table that quietly drops its wrong claims is worse than one that says so.
+**2. Nothing to keep in sync.**
 
----
+`requirements: []`. One folder, using the `aiohttp` that Home Assistant already ships.
+
+That isn't a style preference — Southern Company breaks the login flow once or twice a year, and
+this determines how a fix reaches you. When the September 2026 migration landed, the alternative
+needed a fix in the **library**, a **PyPI release**, then a dependency bump and release in the
+**integration** — commits in two repositories on the same day, plus a version bump in a third
+place. Here the same fix is one file, and you get it by pulling the repo.
+
+**3. Twelve hours between polls, not one.**
+
+Their hourly cadence earns its keep — they surface live-ish billing projections that genuinely
+move during the day. This integration does one thing, hourly statistics, and **that data lags
+24–48 hours no matter what**, so polling 24 times a day would fetch the same answer 24 times.
+
+That matters because there is no public API here. This signs in the way a browser does, against a
+portal with Imperva bot protection and terms that don't contemplate automation. **Two requests a
+day instead of twenty-four is a twelvefold smaller footprint** on someone else's infrastructure,
+using your real credentials. That's a deliberate choice, and it's why you won't find a
+"poll faster" option.
+
+**4. When it breaks, it tells you what broke.**
+
+Every sensor in both projects reports a value from the last successful update — so when an update
+fails, they all go `unavailable` together, at exactly the moment you need an explanation. Their
+sensor list is entirely data values.
+
+This one adds a **Status** sensor that is deliberately *always available*: `ok`, `invalid_auth`,
+`utility_outage`, `blocked` or `error`, with the underlying message on a `last_error` attribute.
+The difference in practice is between an alert that says "the sensor is unavailable" and one that
+says "Georgia Power rejected your password — and this will not retry on its own, because repeated
+failures risk locking your utility account."
+
+A rejected session also re-authenticates and retries **once**, immediately, rather than waiting out
+the twelve hours to the next scheduled update.
+
+### Why you might not
+
+Genuinely — for a lot of readers theirs is the better answer:
+
+- **You're not in Georgia**, or you have **Nicor Gas**. Theirs covers gas properly; this doesn't.
+- **You have several accounts** on one login. Theirs handles that; this doesn't.
+- **You want the billing projections** — projected bill, average daily cost, days into the cycle.
+  Theirs has roughly four times as many sensors and they're useful ones.
+- **Your meter isn't AMI**, so hourly data doesn't exist. Theirs falls back to daily; this
+  imports nothing.
+- **You'd rather run what other people run.** 34 stars, a HACS quality scale, and years of
+  real-world use against a project with one user is a real argument, and I'd make it too.
+
+### Two honest notes
+
+- **Both Python projects shipped fixes for the September 2026 Georgia Power login change on the
+  same day this was written.** They are actively maintained. Any "they're stale" framing you read
+  elsewhere — including in an earlier draft of this file — is wrong.
+- An earlier draft claimed their hourly path was broken on residential accounts, citing
+  [issue #124](https://github.com/Southern-Company-HA/southern-company-hacs/issues/124).
+  **That issue is closed and was fixed in August 2026.** The claim is gone. It's recorded here
+  rather than quietly deleted, because a comparison table that drops its wrong claims without
+  saying so shouldn't be trusted on the ones it keeps.
 
 ## Is this allowed?
 
@@ -204,8 +274,10 @@ Worth knowing before you install it:
 
 ## Not supported
 
-- Alabama Power, Mississippi Power, Nicor Gas — use `southern-company-hacs` for those
-- More than one account on a single login
+- **Nicor Gas** — gas service, handled differently by the portal. Use `southern-company-hacs`.
+- **Alabama / Mississippi Power** — probably fine (see above), but genuinely untested.
+- **More than one account on a single login** — one account per config entry, and the first
+  active electric agreement wins
 - Sub-hourly data — Southern Company doesn't expose it (15-minute intervals return empty)
 - Prepaid accounts, and meters that aren't AMI
 

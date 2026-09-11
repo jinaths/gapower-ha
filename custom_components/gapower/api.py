@@ -74,6 +74,14 @@ OIDC_INIT_PARAMS = {
     "WL_Type": "E",
     "BrowserContextTarget": "Top",
     "WL_CancelUrl": f"{CS2}/Account/Login",
+    # NOT load-bearing, despite the name. Probed unauthenticated 2026-09-10: GPC, APC,
+    # MPC, SCS, a nonsense value and an empty string ALL return the same 302 to AM's
+    # authorize endpoint with a fresh state + PKCE challenge. Southern Company runs one
+    # ForgeRock realm for every operating company, so the login chain is not
+    # Georgia-specific and this value is never validated. Left as "GPC" only because
+    # that is what a real browser sends. The operating company that actually matters is
+    # read per-account in `resolve_account` and passed to the usage API as
+    # `operatingCompany`.
     "Company": "GPC",
     "originalPath": "/OCC/login",
 }
