@@ -1,78 +1,111 @@
 # Georgia Power for Home Assistant
 
-Pulls **hourly** electricity usage and cost from your Georgia Power (Southern Company) account
-into the Home Assistant **Energy Dashboard**. Runs entirely inside HA — no external host, no
-cron, no separate Python environment.
+See your Georgia Power electricity use in Home Assistant's Energy Dashboard — **hour by hour**,
+with cost, going back a full year.
 
-- Hourly kWh + cost, imported as long-term statistics
-- ~365 days backfilled on first run, then incremental
-- Native config flow, and a reauth prompt if the credentials stop working
-- **Zero PyPI dependencies** — uses `aiohttp`, which HA already ships
+No extra hardware. No separate server or script to run. No add-ons. You enter your
+georgiapower.com login once, and Home Assistant does the rest.
 
-> ## Status: working
->
-> Southern Company's Aug 31 – Sep 8 2026 CIS migration **replaced the entire login
-> system** with ForgeRock/PingAM OIDC and moved the usage API to new hosts. The auth
-> chain and data client were rewritten for it and have been running since
-> 2026-09-08 — see [2026-09 migration](#2026-09-southern-company-migration) for the
-> full mapping of what changed and why the old flow could not be patched.
+---
 
-## Why not `southern-company-hacs`?
+## What you get
 
-That integration is the obvious alternative. Reasons this exists instead:
+Your Energy Dashboard fills in with real metered data from Georgia Power:
 
-| | southern-company-hacs | this |
-|---|---|---|
-| Last tagged release | `1.0.0`, Aug 2024 (HACS installs this, not `main`) | — |
-| In HACS default store | no — manual custom repo either way | no |
-| Dependency | pins `southern-company-api==0.7.0` | none |
-| Auth first hop | that library's older `GET` + scrape `data-aft` | the newer JSON `POST` flow |
-| Hourly data | reported broken on residential accounts (issue #124) | verified working |
-| Failure backoff | 600s, in-memory | escalating, survives restarts |
+- **Hourly** kilowatt-hours and dollars — not just a daily total
+- **About a year of history** backfilled the first time it runs
+- Automatic updates twice a day after that
+- A handful of sensors so you can tell at a glance whether it's still working
 
-Full analysis: [`../georgia-power-integration.md`](../georgia-power-integration.md).
+This reads your account. It never changes anything, never pays a bill, and never touches
+your thermostat or anything else.
+
+## Before you start
+
+You need:
+
+- **Home Assistant** 2024.6 or newer (any install type)
+- A **Georgia Power online account** — the same username and password you use at
+  georgiapower.com. If you've never signed in online, create the account there first.
+- A **residential account with an AMI ("smart") meter.** Nearly all Georgia Power residential
+  customers have one. If your meter is still read by hand, hourly data won't exist.
+
+That's it.
 
 ## Install
 
-HACS → three-dot menu → **Custom repositories** → add this repo, category **Integration** →
-install → restart HA → **Settings → Devices & Services → Add Integration → Georgia Power**.
+### With HACS (recommended)
 
-Or copy `custom_components/gapower/` into your HA `config/custom_components/` and restart.
+1. Open **HACS** in Home Assistant
+2. Click the **⋮** menu (top right) → **Custom repositories**
+3. Paste `https://github.com/jinaths/gapower-ha`, choose category **Integration**, click **Add**
+4. Find **Georgia Power** in the list and click **Download**
+5. **Restart Home Assistant**
+6. Go to **Settings → Devices & Services → + Add Integration**, search for **Georgia Power**,
+   and enter your georgiapower.com username and password
 
-## Set up the Energy Dashboard
+### Without HACS
 
-**Settings → Dashboards → Energy → Add consumption**, pick *Georgia Power Energy Consumption*,
-and attach *Georgia Power Energy Cost* as its cost. Statistics appear under
-`gapower:energy_consumption` and `gapower:energy_cost`.
+Copy the `custom_components/gapower/` folder into your Home Assistant `config/custom_components/`
+folder, restart, then follow step 6 above.
 
-The first run backfills a year, which takes a couple of minutes and ~13 requests. After that it
-polls twice a day and imports only the last few hours.
+## Add it to the Energy Dashboard
 
-## Entities
+1. **Settings → Dashboards → Energy**
+2. Under *Grid consumption*, click **Add consumption**
+3. Pick **Georgia Power Energy Consumption**
+4. For cost, choose **Use an entity tracking the total costs** and pick
+   **Georgia Power Energy Cost**
 
-| Entity | Purpose |
+The first run pulls roughly a year of history and takes a couple of minutes. Energy Dashboard
+graphs may take up to an hour to catch up after that — that's Home Assistant, not this
+integration.
+
+## What to expect (please read — these are normal)
+
+**Your data is one to two days behind.** Georgia Power publishes to their own website on a delay,
+and this reads the same thing you'd see there. Today's usage will not appear today. This is the
+single most common surprise, and there is no setting that fixes it — the data does not exist yet.
+
+**Recent costs start low and correct themselves.** Until a billing cycle closes, Georgia Power
+shows unbilled hours at an energy-only rate of about $0.056/kWh. Once the bill is issued, those
+same hours are restated at the full rate — roughly three times higher. The integration re-reads
+the last 45 days on every update specifically so those corrections get picked up, so recent dollar
+figures will rise as they firm up. **Kilowatt-hours are never affected**, only cost.
+
+**It updates twice a day, not continuously.** Polling harder would gain nothing (see the lag
+above) and would draw attention from Southern Company's bot protection.
+
+**Southern Company changes their login flow now and then.** When they do, this breaks until it's
+updated — expect that maybe once or twice a year. It happened in September 2026 and was fixed.
+Your existing history is never lost, and the gap fills itself in once it's working again.
+
+## The sensors
+
+| Sensor | What it tells you |
 |---|---|
-| `sensor.georgia_power_last_reading` | Timestamp of the newest hour imported — **watch this for staleness** |
-| `sensor.georgia_power_latest_hour_usage` | kWh in that hour |
-| `sensor.georgia_power_latest_hour_cost` | Cost of that hour |
-| `sensor.georgia_power_rows_imported` | Rows written on the last run (diagnostic) |
-| `sensor.georgia_power_status` | `ok` / `invalid_auth` / `utility_outage` / `blocked` / `error`, with the failure message on a `last_error` attribute |
+| **Status** | `ok`, or *why* it isn't — `invalid_auth`, `utility_outage`, `blocked`, `error` |
+| **Last reading** | Timestamp of the newest hour imported. If this stops moving, something's wrong. |
+| **Latest hour usage** | kWh in that hour |
+| **Latest hour cost** | Cost of that hour |
+| **Rows imported** | How many hours the last update wrote (diagnostic) |
 
-`status` is the only entity here that stays **available when a poll fails** — the
-others report values from the last successful run, so they all go `unavailable` at
-exactly the moment something needs to explain itself. Alert on the others; read
-`status` to find out why.
+**Status is the one to watch.** It's deliberately the only sensor that stays available when an
+update fails — all the others report values from the last good run, so they all go `unavailable`
+at exactly the moment you need something to explain itself. Status stays up and names the cause,
+and carries the full error message in its `last_error` attribute.
 
-### Staleness alarm
+### Optional: get told when it stops working
 
-A broken scraper looks identical to "no new data." Watch the timestamp:
+A broken scraper and a quiet night look identical on a graph. This automation catches both, and
+tells you which:
 
 ```yaml
 alias: Georgia Power data stale
 triggers:
   - trigger: template
-    # `ts is none` catches unknown/unavailable - total integration failure - which a
-    # bare subtraction misses, because now() - None raises and the trigger never fires.
+    # `ts is none` catches unknown/unavailable — total failure — which a bare
+    # subtraction misses, because now() - None raises and the trigger never fires.
     value_template: >
       {% set ts = states('sensor.georgia_power_last_reading') | as_datetime %}
       {{ ts is none or (now() - ts).total_seconds() > 172800 }}
@@ -85,117 +118,165 @@ actions:
         {{ state_attr('sensor.georgia_power_status', 'last_error') }}
 ```
 
-Read `status` in the message rather than just reporting that the data sensor is
-`unavailable`. "Unavailable" is true of a wrong password, a utility outage, a WAF
-block and a network blip alike, and the difference decides whether there is
-anything for you to do.
+Swap `notify.persistent_notification` for your phone's notify service to actually get told —
+a persistent notification only appears inside Home Assistant, which is no use if you aren't
+looking at it.
 
-## Expectations
+---
 
-- Data lags the portal by **~24–48 hours**. The most recent hours will be missing; that's normal.
-- **Recent cost is provisional and gets revised.** Verified against the live API 2026-08-09:
-  unbilled hours carry an energy-only charge (~$0.056/kWh) which Georgia Power trues up to the
-  full effective rate (~$0.17/kWh) once the billing cycle closes. So the last few weeks of cost
-  will read low and then correct themselves. The integration re-imports the last
-  `REFETCH_DAYS` (45) every run specifically so those corrections get picked up — don't lower
-  that value below a billing cycle or the understated numbers become permanent.
-  Usage (kWh) is not affected, only cost.
-- Southern Company changes their login flow every so often. When they do, this breaks until the
-  auth chain is updated — expect that once or twice a year. It happened in September 2026, and
-  that one was a full replacement rather than a tweak: see
-  [2026-09 migration](#2026-09-southern-company-migration).
-- Bot protection (Imperva) can block requests from your IP for ~30 minutes. The integration backs
-  off rather than hammering.
-- **Sessions are reused between polls, and the portal drops them without warning.** When it does,
-  the usage API answers with a `302` back to the login flow rather than a `401`. That is treated as
-  a session rejection: the integration re-authenticates and retries the poll once, so a dropped
-  session costs a few extra requests rather than the twelve hours until the next scheduled run.
-  It retries exactly once — a genuinely rejected account must never become a login loop against
-  the utility.
+## How this compares to the alternatives
 
-## 2026-09 Southern Company migration
+**Snapshot taken 2026-09-10.** All of these are actively developed — check their repos before
+taking this table as current.
 
-Southern Company ran a planned CIS migration **Aug 31 – Sep 8 2026**. During the outage every
-`customerservice2` route — including unauthenticated ones — `302`'d to
-`friendly-error.southernco.com`; the integration now detects that specifically and reports it as
-a utility-side outage rather than a credential problem.
+If you searched for this, you probably found some combination of four links. Two of those are
+the same repository, and two are developer libraries rather than something you can install:
 
-What came back afterwards is a different system.
+| | What it actually is |
+|---|---|
+| [`apearson/southern-company-api`](https://github.com/apearson/southern-company-api) | A **Node.js library**. Not a Home Assistant integration — you'd have to build something with it. |
+| [`Southern-Company-HA/southern_company_api`](https://github.com/Southern-Company-HA/southern_company_api) | A **Python library**, published to PyPI. Also not an integration by itself. |
+| [`Southern-Company-HA/southern-company-hacs`](https://github.com/Southern-Company-HA/southern-company-hacs) | **The real alternative.** A Home Assistant integration that wraps the Python library above. |
+| [`Lash-L/southern-company-hacs`](https://github.com/Lash-L/southern-company-hacs) | **The same repository as the one above**, under its old name — GitHub redirects it. Not a separate option. |
 
-### Auth moved to ForgeRock/PingAM OIDC
+So for a Home Assistant user there is really one alternative. Here is an honest comparison —
+limited to things I actually verified, because I have not read their code closely enough to tell
+you what it lacks:
 
-| | before | after |
+| | southern-company-hacs | this |
 |---|---|---|
-| Credential endpoint | `webauth…/webservices/api/WebUser/Login` (flat JSON) | `customerlogin.southernco.com/am/json/realms/root/realms/alpha/authenticate` (ForgeRock `callbacks[]`) |
-| Service selector | — | `?authIndexType=service&authIndexValue=occSecureLogin` |
-| Token exchange | `webauth…/SPA/Navigation` → scrape `ScWebToken` from a hidden input | `/am/oauth2/authorize`, OIDC auth-code + **PKCE S256**, `client_id=webauthclient`, `response_mode=form_post` |
-| Landing | `POST customerservice2…/Account/LoginComplete` | same, but reached via `webauth…/SPA/signin-forgerock-oidc-authcode` → `/SPA/ExternalAuthentication/forgerock-oidc-authcode` |
+| Utilities covered | Georgia, Alabama, Mississippi Power, Nicor Gas | **Georgia Power only** |
+| Python dependencies | a pinned PyPI library (`southern-company-api`) | **none** — `requirements: []`, uses what Home Assistant already ships |
+| What HACS installs by default | newest tagged release: `1.0.0`, Aug 2024 | this repo's default branch |
+| Users | 34 stars, years of real-world use | new, essentially untested by anyone but me |
 
-`/Account/LoginValidated/JwtToken` still exists and still answers `200`, with
-`{"StatusCode":200,"Message":"Successfully retrieved jwtToken.","Data":null}`. **The step-4
-failure is a symptom, not the bug** — the request is fine, the session behind it isn't. Patching
-step 4 is wasted effort.
+**Pick theirs if** you're not in Georgia, you have Nicor Gas, or you want the option with more
+people behind it and more eyes on it. For most readers that is the right answer, and I'd rather
+say so than pretend otherwise.
 
-### The usage API moved too
+**Pick this if** you're a Georgia Power customer specifically after hourly data, and would rather
+maintain one self-contained thing than an integration plus a separately-versioned library.
 
-`customerservice2api…/MPUData` is gone. Hourly data now comes from:
+### What this one does differently
 
-```
-GET https://occmypowerusageapi.southerncompany.com
-    /api/v1/MyPowerUsage/UsageGraphData/{serviceAgreementId}/Hourly
-    ?accountId=…&personId=…&operatingCompany=GPC
-    &startDate=MM/DD/YYYY&endDate=MM/DD/YYYY
-    &servicePointId=…&premiseId=…
-    &billFactorCode=null&intervalBehavior=Automatic
-```
+Stated as what it does, not as what anything else doesn't:
 
-`Daily` and `Monthly` are sibling routes on the same path. It needs four opaque ~134-character
-identifiers — `serviceAgreementId`, `personId`, `servicePointId`, `premiseId` — sourced from
-`occaccountapi…/api/v1/Accounts/{accountId}/Summary` and `occpersonapi…/api/v1/person/{personId}`.
-Related hosts in the same family: `occbillingapi`, `occcustomerserviceapi`, `occoutageapi`,
-`occpaymentapi`. There is also a bulk-export path hinted at by
-`occcustomerserviceapi…/api/v1/Utilities/getRegistryValue?key=HOURLY_BULK_EXPORT_DAYS`, which may
-be cleaner than reading the graph endpoint.
+- **No dependencies at all.** One folder, `aiohttp`, done. Nothing to version-pin, nothing that can
+  break because a shared library shifted underneath it.
+- **A status sensor that stays available when an update fails**, reporting `ok` / `invalid_auth` /
+  `utility_outage` / `blocked` / `error` with the message attached. Every other sensor here reports
+  the last good run, so they all go `unavailable` at exactly the moment you need an explanation.
+- **A rejected session re-authenticates and retries immediately** rather than waiting out the
+  twelve hours to the next scheduled update — once, never in a loop, because repeated failed
+  logins risk locking a utility account.
+- **Re-reads 45 days every run**, so Georgia Power's retroactive cost corrections actually land
+  instead of freezing at the provisional rate.
+- **Refuses to guess.** Where this can't tell a real value from a placeholder, it imports nothing
+  rather than importing something wrong.
 
-**All three endpoint quirks below survived the migration unchanged.**
+### Credit, and a caveat about this whole section
 
-### How this was diagnosed, and one security warning
+- **`apearson/southern-company-api` worked the login chain out first**, and this project's
+  pre-migration flow was ported from it. That's where the hard part came from.
+- **Both Python projects above shipped fixes for the September 2026 Georgia Power login change on
+  the same day this was written.** They are actively maintained. The tagged-release row is a real
+  difference for HACS users *today* and is one `git tag` away from being wrong.
+- An earlier draft of this table claimed their hourly path was broken on residential accounts,
+  citing [issue #124](https://github.com/Southern-Company-HA/southern-company-hacs/issues/124).
+  **That issue is closed and appears to have been fixed in August 2026.** Left here as a note
+  because a comparison table that quietly drops its wrong claims is worse than one that says so.
 
-The scripted diagnostic in `tools/` was actively misleading here — see the warning in its
-docstring. What actually worked was capturing a **browser HAR** of a real manual login and diffing
-it against what the integration sends.
+---
 
-> ⚠️ **Do not treat a HAR of a login as safe, even a "sanitized" one.** Chrome's
-> *Save as HAR (sanitized)* strips cookies, auth headers, and the `"password"` JSON key — but it
-> does **not** understand ForgeRock's `callbacks[]` array, so the account password was written to
-> the "sanitized" file in plaintext anyway. Parse HARs with a redacting script rather than reading
-> them raw, delete them afterwards, and rotate any password one has touched.
+## Is this allowed?
 
-## Endpoint quirks (do not "fix" these)
+Worth knowing before you install it:
 
-Verified live 2026-08-06/07. Each of these silently produces `HasData=false`:
-
-1. **`EndDate` is exclusive.** `StartDate == EndDate` returns nothing. Always pass last-wanted-day + 1.
-2. **No time component on dates.** `MM/DD/YYYY` works; `"MM/DD/YYYY 11:59:59 PM"` fails even with the +1.
-3. **`intervalBehavior` must be `Automatic`** (or `Interval`). `Hourly` returns null on the `/Hourly` route.
-
-And on bot detection: a *successful* response contains `_Incapsula_Resource`, `/_Incapsula_`, and
-sometimes `reese84` — those are the Imperva client SDK, present whether or not you're blocked.
-Southern Company's `/SPA/Navigation` step also legitimately returns a `<title>Loading</title>`
-shell that carries the token. Matching on any of those blocks working logins. Only
-`"Request unsuccessful"` / `"Incapsula incident"` mean actually blocked.
-
-## Security
-
-Credentials are stored by Home Assistant in `.storage/core.config_entries` as **unencrypted
-JSON**, like every other HA integration. Anyone with file access to your HA config can read them.
-Consider a Georgia Power password not reused anywhere else.
-
-Automated access to the customer portal is very likely contrary to Southern Company's terms of
-service. This is personal, low-volume, read-only access to your own account — but that tradeoff
-is yours to make knowingly.
+- **This is very likely against Southern Company's terms of service.** There is no public API;
+  this signs in the way a browser does and reads your own data. It's personal, read-only access to
+  your own account at about two requests every twelve hours. That tradeoff is yours to make
+  knowingly, and it is why this doesn't poll more often.
+- **Your password is stored the way every Home Assistant integration stores credentials** — as
+  plain JSON in `config/.storage/core.config_entries`. Anyone with file access to your Home
+  Assistant can read it. **Use a Georgia Power password you don't reuse anywhere else.**
+- Your credentials go to Southern Company and nowhere else. This project has no server, collects
+  nothing, and phones nothing home.
 
 ## Not supported
 
-Alabama Power / Mississippi Power (the service-point lookup is Georgia-specific), Nicor Gas,
-multiple accounts on one login, and sub-hourly data (Southern Company doesn't expose it).
+- Alabama Power, Mississippi Power, Nicor Gas — use `southern-company-hacs` for those
+- More than one account on a single login
+- Sub-hourly data — Southern Company doesn't expose it (15-minute intervals return empty)
+- Prepaid accounts, and meters that aren't AMI
+
+## Something's wrong
+
+1. **Check the Status sensor first** — it names the cause and carries the message.
+2. `utility_outage` or `blocked` → wait. Both clear on their own; reloading makes a bot-detection
+   block worse, not better.
+3. `invalid_auth` → your password changed, or Georgia Power wants you to reset it. Sign in at
+   georgiapower.com in a browser to confirm, then re-enter it in Home Assistant. **This
+   deliberately does not retry on its own** — repeated failed logins risk locking your utility
+   account.
+4. Still stuck → open an issue with your Home Assistant version and the Status sensor's
+   `last_error`. **Don't paste raw logs without reading them first.**
+
+---
+
+## For developers
+
+<details>
+<summary>How the login works, and the endpoint traps (click to expand)</summary>
+
+### The September 2026 migration
+
+Southern Company ran a CIS migration Aug 31 – Sep 8 2026 that replaced the entire authentication
+system and moved the usage API to new hosts.
+
+| | before | after |
+|---|---|---|
+| Credentials | `webauth…/webservices/api/WebUser/Login` (flat JSON) | `customerlogin.southernco.com/am/json/realms/root/realms/alpha/authenticate` (ForgeRock `callbacks[]`) |
+| Token exchange | scrape `ScWebToken` from a hidden input | `/am/oauth2/authorize`, OIDC auth-code + **PKCE S256**, `response_mode=form_post` |
+| Usage data | `customerservice2api…/MPUData` | `occmypowerusageapi…/api/v1/MyPowerUsage/UsageGraphData/{serviceAgreementId}/Hourly` |
+
+Things that cost real time to work out:
+
+- **The API bearer token arrives as a *response header*, `ScJwtToken`** — not a cookie, not a body
+  field, and it is sent on *every* response. `/Account/LoginValidated/JwtToken` answers `200` with
+  `"Data":null` and no `Set-Cookie`; the token was in the headers the whole time. Their own Angular
+  bundle harvests it with a response interceptor, and so does this.
+- **ForgeRock does not set the AM session cookie for you.** You must read `tokenId` out of the
+  auth response and install the cookie yourself. The cookie's *name* is tenant-specific — read it
+  from `/am/json/serverinfo/*` rather than assuming `iPlanetDirectoryPro`.
+- **Fill ForgeRock callbacks by `type`, never by array index or `IDTokenN` name.** The live tree
+  renumbers them.
+- **A `3xx` from the JSON API means your session was rejected**, not that something moved. These
+  hosts redirect a stale bearer back to the login flow instead of returning `401`.
+- **`/Billing/Home` returns `200` to anyone**, signed in or not — so it cannot be used as a test of
+  whether a session is still alive.
+
+### Endpoint quirks — do not "fix" these
+
+Each of these silently returns empty rather than erroring, which is this API's whole personality:
+
+1. **`endDate` is exclusive.** `startDate == endDate` returns nothing. Always pass last-wanted-day + 1.
+2. **No time component on dates.** `MM/DD/YYYY` works; `"MM/DD/YYYY 11:59:59 PM"` fails even with the +1.
+3. **`intervalBehavior` must be `Automatic`** (or `Interval`). `Hourly` returns null on the `/Hourly` route.
+4. **Parameter casing is inconsistent between sibling routes on the same host.** `UsageGraphData`
+   takes camelCase (`servicePointId`); `BillPeriods` takes PascalCase (`ServicePointId`).
+
+### On bot detection
+
+A *successful* response contains `_Incapsula_Resource`, `/_Incapsula_` and sometimes `reese84` —
+that's the Imperva client SDK, present whether or not you're blocked. Matching on any of those
+blocks working logins. Only `"Request unsuccessful"` / `"Incapsula incident"` mean actually blocked.
+
+### If you capture a HAR to debug this
+
+⚠️ **Chrome's "Save as HAR (sanitized)" is not enough.** It strips cookies, auth headers and the
+`"password"` JSON key — but it does **not** understand ForgeRock's `callbacks[]` array, so the
+account password lands in the "sanitized" file in plaintext anyway. Parse HARs with a redacting
+script rather than reading them raw, delete them afterwards, and rotate any password one has
+touched.
+
+</details>
