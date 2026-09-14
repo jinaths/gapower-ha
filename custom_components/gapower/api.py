@@ -43,7 +43,7 @@ from urllib.parse import urlencode, urljoin, urlparse
 import aiohttp
 from yarl import URL
 
-from .const import CHUNK_DAYS, SENTINEL
+from .const import BILL_PERIOD_LOOKBACK_DAYS, CHUNK_DAYS, SENTINEL
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -191,43 +191,6 @@ def _attr(tag: str, name: str) -> str | None:
     """Read one HTML attribute, tolerating either quote style and loose spacing."""
     m = re.search(rf"""{name}\s*=\s*["']([^"']*)["']""", tag, re.I)
     return m.group(1) if m else None
-
-
-_DATEISH = re.compile(r"^\d{1,4}[-/]\d{1,2}[-/]\d{1,4}([T ]|$)")
-
-
-def _probe(label: str, obj: Any) -> None:
-    """TEMPORARY (2026-09-10, phase 0 of demand-alert-plan.md): find the billing cycle.
-
-    CLAUDE.md records the cycle as coming from the portal's `billGroupPeriod`, but
-    nothing reads that field and no note says which response carries it. These
-    payloads are already fetched and mostly discarded, so this reads them at no
-    request cost. DELETE once the cycle's home is known.
-
-    Key names are always printed - they are what we are hunting for. Values are
-    printed only when they look like a date, plus bare numbers and booleans. Every
-    other string shows its length only, so account numbers, person ids and the
-    134-char DataProtection blobs never reach the log.
-    """
-    if not isinstance(obj, dict):
-        _LOGGER.info("PROBE %s: not a dict (%s)", label, type(obj).__name__)
-        return
-    out = []
-    for k in sorted(obj):
-        v = obj[k]
-        if isinstance(v, bool) or v is None or isinstance(v, (int, float)):
-            out.append(f"{k}={v}")
-        elif isinstance(v, str):
-            out.append(f"{k}={v!r}" if _DATEISH.match(v) else f"{k}=<str {len(v)}>")
-        elif isinstance(v, dict):
-            out.append(f"{k}={{{','.join(sorted(v))}}}")
-        elif isinstance(v, list):
-            first = v[0] if v else None
-            inner = f"[{','.join(sorted(first))}]" if isinstance(first, dict) else ""
-            out.append(f"{k}=<list {len(v)}>{inner}")
-        else:
-            out.append(f"{k}=<{type(v).__name__}>")
-    _LOGGER.info("PROBE %s: %s", label, " | ".join(out))
 
 
 def _exp_utc(claims: dict[str, Any]) -> dt.datetime | None:
@@ -782,12 +745,10 @@ class GaPowerApi:
             return
 
         payload = await self._get_json(f"{ACCOUNT_API}/Cap/", "Cap")
-        _probe("Cap.envelope", payload)
         accounts = payload.get("data") or []
         if not accounts:
             raise GaPowerError("No accounts returned")
         acct = next((a for a in accounts if a.get("isPrimaryAccount")), accounts[0])
-        _probe("Cap.account", acct)
         self.account = str(acct.get("accountNumber") or "")
         self.company = acct.get("company") or "GPC"
         if not self.account:
@@ -796,9 +757,7 @@ class GaPowerApi:
         summary = await self._get_json(
             f"{ACCOUNT_API}/Accounts/{self.account}/Summary", "Accounts/Summary"
         )
-        _probe("Summary.envelope", summary)
         data = summary.get("data") or {}
-        _probe("Summary.data", data)
         self.person_id = data.get("mainPersonId")
 
         # Accounts can carry gas and other agreements alongside electric; only the
@@ -815,7 +774,6 @@ class GaPowerApi:
         if agreement is None:
             kinds = sorted({str(a.get("serviceTypeCode")) for a in agreements})
             raise GaPowerError(f"No active electric service agreement; found {kinds}")
-        _probe("Summary.agreement", agreement)
         self.service_agreement = agreement.get("serviceAgreementId")
         self.premise_id = agreement.get("premiseId")
 
@@ -835,6 +793,58 @@ class GaPowerApi:
         ]
         if missing:
             raise GaPowerError(f"Account summary missing required ids: {missing}")
+
+    async def async_get_bill_periods(self) -> list[tuple[dt.date, dt.date]]:
+        """Every bill cycle the portal knows about, oldest first, `end` EXCLUSIVE.
+
+        Cheap: same host and bearer as the usage call, and `resolve_account` already
+        holds all three identifiers, so this is one extra GET of about 1.2 KB.
+
+        The cycle has to be read rather than assumed. The user's own bill dates land
+        on day 25-28 of the month with cycles of 29-32 days, because it is meter-read
+        driven and not calendar driven - a hardcoded "reset on the 28th" would have
+        been wrong on 3 of the last 7 cycles, and wrong precisely at the boundary,
+        which is the one place it changes which cycle an hour is charged to.
+
+        WARNING: the parameters are PascalCase. The sibling UsageGraphData route on
+        this very host is camelCase. This API answers a wrong parameter shape with an
+        empty result rather than an error, so a casing slip here would not raise - it
+        would look exactly like "this account has no bill periods" and be believed.
+        """
+        today = dt.date.today()
+        params = {
+            "ServiceAgreementId": self.service_agreement,
+            "ServicePointId": self.service_point,
+            "PremiseId": self.premise_id,
+            "StartDate": (
+                today - dt.timedelta(days=BILL_PERIOD_LOOKBACK_DAYS)
+            ).strftime("%m/%d/%Y"),
+            # Deliberately today, not today+1. Unlike the usage routes this window is
+            # a filter over whole periods rather than a day range, and a capture of
+            # the portal's own SPA shows EndDate=<capture date> returning the
+            # in-progress cycle. Mirror the shape that is known to work.
+            "EndDate": today.strftime("%m/%d/%Y"),
+            "OperatingCompany": self.company,
+        }
+        payload = await self._get_json(
+            f"{USAGE_API}/MyPowerUsage/BillPeriods", "BillPeriods", params=params
+        )
+        periods = _parse_bill_periods(payload)
+        if not periods:
+            # Key names only - never values. This is the one diagnostic that matters
+            # if the response shape is not what _parse_bill_periods expects, and
+            # without it a schema mismatch is indistinguishable from a new account.
+            _LOGGER.warning(
+                "BillPeriods returned no usable periods (top-level keys: %s). Falling "
+                "back to the last known cycle boundary.",
+                sorted(payload) if isinstance(payload, dict) else type(payload).__name__,
+            )
+        else:
+            _LOGGER.debug(
+                "BillPeriods: %s cycles, most recent %s -> %s (end exclusive)",
+                len(periods), periods[-1][0], periods[-1][1],
+            )
+        return periods
 
     async def async_get_hourly(
         self, start: dt.date, last_day: dt.date
@@ -882,11 +892,7 @@ class GaPowerApi:
             "UsageGraphData/Hourly",
             params=params,
         )
-        _probe("UsageGraphData.envelope", payload)
         data = payload.get("data") or {}
-        # These siblings of `inner` are discarded on every poll and are the most
-        # likely home for the billing period - they arrive with the usage itself.
-        _probe("UsageGraphData.data", data)
         if not data.get("hasData"):
             _LOGGER.debug("No hourly data for %s .. %s", start, last_day)
             return None
@@ -952,3 +958,96 @@ def _merge(parsed: dict[str, Any], acc: dict[dt.datetime, dict[str, float]]) -> 
             ts = _parse_ts(pt)
             if ts is not None:
                 acc.setdefault(ts, {})[field] = float(y)
+
+
+# Keys that could name the two ends of a bill period. The response BODY was never
+# captured - the browser trace recorded this request and its 1223-byte length, not
+# its content - so match on meaning instead of on an exact schema. Every other route
+# on this host answers in camelCase even where it takes PascalCase parameters, and
+# the comparison below is case-folded so either works.
+_PERIOD_START_KEYS = (
+    "startdate", "billstartdate", "periodstartdate", "fromdate", "start",
+)
+_PERIOD_END_KEYS = (
+    "enddate", "billenddate", "periodenddate", "todate", "end",
+)
+
+
+def _as_date(value: Any) -> dt.date | None:
+    """Best-effort date out of whatever this portal put in a date field."""
+    if not isinstance(value, str):
+        return None
+    s = value.strip()
+    m = re.search(r"/Date\((-?\d+)", s)  # legacy ASP.NET epoch-millis form
+    if m:
+        return dt.datetime.fromtimestamp(int(m.group(1)) / 1000).date()
+    head = re.split(r"[T ]", s, 1)[0]  # drop any time component
+    # Ordering is not arbitrary: "2026/09/29" cannot parse as %m/%d/%Y (month 2026),
+    # and "09/29/2026" cannot parse as %Y-%m-%d, so each format rejects the other's
+    # input rather than silently transposing month and day.
+    for fmt in ("%m/%d/%Y", "%Y-%m-%d", "%m-%d-%Y", "%Y/%m/%d"):
+        try:
+            return dt.datetime.strptime(head, fmt).date()
+        except ValueError:
+            continue
+    return None
+
+
+def _normalise_ends(
+    pairs: list[tuple[dt.date, dt.date]]
+) -> list[tuple[dt.date, dt.date]]:
+    """Rewrite `end` as an EXCLUSIVE bound, whichever convention the API meant.
+
+    Consecutive bill cycles tile - one ends exactly where the next begins - so the
+    convention can be read straight off the data instead of guessed. If a period's
+    end equals the next period's start it is already exclusive; if it falls one day
+    earlier the API meant it inclusively and a day is added.
+
+    This changes one thing only: whether the last day of a cycle belongs to it. That
+    is also the hour that decides which bill a spike is charged to, so it is worth
+    taking from evidence rather than assumption.
+    """
+    if len(pairs) < 2:
+        return pairs
+    day = dt.timedelta(days=1)
+    touching = sum(1 for (_, e), (s, _) in zip(pairs, pairs[1:]) if e == s)
+    gapped = sum(1 for (_, e), (s, _) in zip(pairs, pairs[1:]) if e + day == s)
+    if gapped > touching:
+        _LOGGER.debug("BillPeriods end dates look inclusive; shifting to exclusive")
+        return [(s, e + day) for s, e in pairs]
+    return pairs
+
+
+def _parse_bill_periods(payload: dict[str, Any]) -> list[tuple[dt.date, dt.date]]:
+    """(start, end_exclusive) pairs from a BillPeriods response, oldest first."""
+    records: Any = payload.get("data") if isinstance(payload, dict) else None
+    if isinstance(records, dict):
+        # Tolerate one extra level of wrapping, as UsageGraphData does with its
+        # data.data. Take the first list-valued member rather than naming a key we
+        # have not actually seen.
+        records = next(
+            (v for _, v in sorted(records.items()) if isinstance(v, list)), None
+        )
+    if not isinstance(records, list):
+        return []
+
+    pairs: list[tuple[dt.date, dt.date]] = []
+    for rec in records:
+        if not isinstance(rec, dict):
+            continue
+        lowered = {str(k).lower(): v for k, v in rec.items()}
+        start = end = None
+        for key in _PERIOD_START_KEYS:
+            start = _as_date(lowered.get(key))
+            if start:
+                break
+        for key in _PERIOD_END_KEYS:
+            end = _as_date(lowered.get(key))
+            if end:
+                break
+        # A zero- or negative-length period is a parse failure, not a short cycle.
+        if start and end and end > start:
+            pairs.append((start, end))
+
+    pairs.sort()
+    return _normalise_ends(pairs)

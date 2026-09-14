@@ -35,3 +35,23 @@ CHUNK_DAYS = 30
 SENTINEL = -1
 
 CONF_ACCOUNT_NUMBER = "account_number"
+
+# --- Smart Usage tariff -------------------------------------------------------
+# Recorded 2026-09-07 from the user's own rate card. Update both numbers together
+# if Georgia Power reprices; nothing else in the code encodes the tariff.
+
+# Dollars per billed kW, charged on the single highest-usage hour of the whole bill
+# cycle - whenever it falls. It is NOT limited to the on-peak window, which is why a
+# 9pm Sunday spike costs exactly as much here as a 3pm Tuesday one.
+DEMAND_RATE = 12.44
+
+# Georgia Power rounds the demand kW HALF-UP: 4.49 kWh bills as 4 kW, 4.50 as 5 kW
+# (user-confirmed against a real bill, 2026-09-09). The charge is therefore a STEP
+# function, not a slope - the only thing that matters is which side of the next X.50
+# the cycle's worst hour lands on. Shaving 0.4 off a 4.9 kWh hour saves nothing;
+# shaving 0.13 off a 4.62 kWh hour saves the entire $12.44.
+DEMAND_ROUNDING = 0.5
+
+# How far back to ask for bill periods. Mirrors the two-year span the portal's own
+# SPA requests - the one window shape known to return the current cycle.
+BILL_PERIOD_LOOKBACK_DAYS = 730

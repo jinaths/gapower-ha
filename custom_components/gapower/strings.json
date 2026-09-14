@@ -41,6 +41,18 @@
       "imported_rows": {
         "name": "Rows imported"
       },
+      "cycle_peak": {
+        "name": "Cycle peak hour"
+      },
+      "billed_demand": {
+        "name": "Billed demand"
+      },
+      "demand_charge": {
+        "name": "Demand charge"
+      },
+      "cycle_start": {
+        "name": "Cycle start"
+      },
       "status": {
         "name": "Status",
         "state": {

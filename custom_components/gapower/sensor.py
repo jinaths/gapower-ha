@@ -18,7 +18,7 @@ from homeassistant.components.sensor import (
     SensorEntityDescription,
     SensorStateClass,
 )
-from homeassistant.const import EntityCategory, UnitOfEnergy
+from homeassistant.const import EntityCategory, UnitOfEnergy, UnitOfPower
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.device_registry import DeviceEntryType, DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
@@ -34,6 +34,31 @@ class GaPowerSensorDescription(SensorEntityDescription):
     """Describes a Georgia Power sensor."""
 
     value_fn: Callable[[dict[str, Any]], Any]
+    # Optional extra attributes. Used by billed_demand to carry the whole bracket
+    # picture on one entity, so an alert can be rendered from a single state object
+    # rather than joining four sensors that update at slightly different moments.
+    attrs_fn: Callable[[dict[str, Any]], dict[str, Any]] | None = None
+
+
+def _demand_attrs(d: dict[str, Any]) -> dict[str, Any]:
+    """Everything an alert needs about the current bracket, on one entity."""
+    return {
+        "peak_kwh": d.get("cycle_peak"),
+        "peak_time": d.get("cycle_peak_time"),
+        "charge": d.get("demand_charge"),
+        # Stay at or below target_kwh and the bill drops a whole bracket; shed_kwh is
+        # what that costs from the current peak. Expressed as a ceiling on purpose -
+        # the charge is a step function, so a percentage target is meaningless and
+        # can be satisfied while saving nothing.
+        "target_kwh": d.get("target_kwh"),
+        "shed_kwh": d.get("shed_kwh"),
+        "lower_charge": d.get("lower_charge"),
+        "next_bracket_kwh": d.get("next_bracket_kwh"),
+        "cycle_start": d.get("cycle_start"),
+        "cycle_end": d.get("cycle_end"),
+        "cycle_day": d.get("cycle_day"),
+        "cycle_length": d.get("cycle_length"),
+    }
 
 
 SENSORS: tuple[GaPowerSensorDescription, ...] = (
@@ -69,6 +94,44 @@ SENSORS: tuple[GaPowerSensorDescription, ...] = (
         entity_category=EntityCategory.DIAGNOSTIC,
         state_class=SensorStateClass.MEASUREMENT,
         value_fn=lambda d: d.get("imported"),
+    ),
+    # --- demand charge -------------------------------------------------------
+    # Georgia Power bills the single highest-usage hour of the whole cycle at
+    # $12.44/kW, rounded half-up. On a recent cycle that one hour was worth $62.20
+    # against $6.43 for all the on-peak energy put together, so these four are the
+    # expensive numbers on the bill, not the kWh totals.
+    GaPowerSensorDescription(
+        key="cycle_peak",
+        translation_key="cycle_peak",
+        device_class=SensorDeviceClass.ENERGY,
+        native_unit_of_measurement=UnitOfEnergy.KILO_WATT_HOUR,
+        value_fn=lambda d: d.get("cycle_peak"),
+        attrs_fn=lambda d: {"peak_time": d.get("cycle_peak_time")},
+    ),
+    GaPowerSensorDescription(
+        key="billed_demand",
+        translation_key="billed_demand",
+        device_class=SensorDeviceClass.POWER,
+        native_unit_of_measurement=UnitOfPower.KILO_WATT,
+        state_class=SensorStateClass.MEASUREMENT,
+        value_fn=lambda d: d.get("billed_demand"),
+        attrs_fn=_demand_attrs,
+    ),
+    GaPowerSensorDescription(
+        key="demand_charge",
+        translation_key="demand_charge",
+        device_class=SensorDeviceClass.MONETARY,
+        value_fn=lambda d: d.get("demand_charge"),
+    ),
+    # Exposed so the window these are measured over is visible rather than implied -
+    # it is meter-read driven, lands on day 25-28, and runs 29-32 days.
+    GaPowerSensorDescription(
+        key="cycle_start",
+        translation_key="cycle_start",
+        device_class=SensorDeviceClass.TIMESTAMP,
+        entity_category=EntityCategory.DIAGNOSTIC,
+        value_fn=lambda d: d.get("cycle_start"),
+        attrs_fn=lambda d: {"cycle_end": d.get("cycle_end")},
     ),
 )
 
@@ -118,6 +181,13 @@ class GaPowerSensor(CoordinatorEntity[GaPowerCoordinator], SensorEntity):
         if isinstance(value, dt.datetime):
             return value
         return value
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any] | None:
+        fn = self.entity_description.attrs_fn
+        if fn is None or not self.coordinator.data:
+            return None
+        return fn(self.coordinator.data)
 
     @property
     def native_unit_of_measurement(self) -> str | None:
