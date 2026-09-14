@@ -134,11 +134,49 @@ Your existing history is never lost, and the gap fills itself in once it's worki
 | **Latest hour usage** | kWh in that hour |
 | **Latest hour cost** | Cost of that hour |
 | **Rows imported** | How many hours the last update wrote (diagnostic) |
+| **Cycle peak hour** | The worst single hour of the current billing cycle, in kWh |
+| **Billed demand** | That hour rounded half-up to whole kW — what a demand charge is billed on |
+| **Demand charge** | Billed demand x your demand rate |
+| **Cycle start** | When the current billing cycle began (read from your account, not guessed) |
 
 **Status is the one to watch.** It's deliberately the only sensor that stays available when an
 update fails — all the others report values from the last good run, so they all go `unavailable`
 at exactly the moment you need something to explain itself. Status stays up and names the cause,
 and carries the full error message in its `last_error` attribute.
+
+### If your plan has a demand charge
+
+Some Southern Company residential plans (Georgia Power's **Smart Usage**, for one) add a charge
+based on your **single highest-usage hour of the whole billing cycle** — separate from the per-kWh
+energy charge, and not limited to peak hours. A big hour at 9pm on a Sunday costs exactly as much
+here as one at 3pm on a Tuesday.
+
+It is easy to underestimate. On one real cycle that single hour was worth **$62.20**, against
+**$6.43** for all the on-peak energy put together.
+
+The last four sensors track it. Two things are worth knowing about how it behaves:
+
+**It's a step, not a slope.** The kW is rounded half-up — 4.49 kWh bills as 4 kW, 4.50 bills as 5.
+So shaving 0.4 kWh off a 4.9 kWh hour saves nothing at all, while shaving 0.13 off a 4.62 hour saves
+a whole bracket. This is why `billed_demand` carries a **`target_kwh`** attribute: a ceiling to stay
+under is actionable, a percentage reduction is not.
+
+**It's a running maximum.** Once the cycle's worst hour has happened, that cycle's charge is set and
+cannot come back down. The useful moment to act is *before* the spike, which makes this a
+scorekeeper and a feedback loop rather than a guardrail — change something, and a couple of days
+later it tells you whether the change worked.
+
+`billed_demand` also carries `peak_kwh`, `peak_time`, `charge`, `shed_kwh`, `lower_charge`,
+`next_bracket_kwh` and the cycle window, so an alert can be built from that one entity.
+
+> **Check your own rate card.** The rate is set in `const.py` as `DEMAND_RATE` and defaults to
+> Georgia Power's Smart Usage figure. If your plan has no demand charge, or a different rate, these
+> four sensors will be wrong — the usage and cost data is unaffected either way.
+
+The billing cycle is read from your account rather than assumed, because it is meter-read driven:
+across one real year the bills landed on days 25-28 of the month with cycles of 29-32 days, so any
+fixed "resets on the 28th" would have been wrong on 3 cycles out of 7 — and wrong precisely at the
+boundary, which is the one place it changes which bill an hour counts towards.
 
 ### Optional: get told when it stops working
 
