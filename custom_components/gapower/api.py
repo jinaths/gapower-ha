@@ -794,29 +794,6 @@ class GaPowerApi:
         if missing:
             raise GaPowerError(f"Account summary missing required ids: {missing}")
 
-    async def _try_bill_periods(
-        self, names: tuple[str, ...], today: dt.date
-    ) -> tuple[list[tuple[dt.date, dt.date]], dict[str, Any]]:
-        """One BillPeriods request under a given parameter-naming convention."""
-        values = (
-            self.service_agreement,
-            self.service_point,
-            self.premise_id,
-            (today - dt.timedelta(days=BILL_PERIOD_LOOKBACK_DAYS)).strftime("%m/%d/%Y"),
-            # Deliberately today, not today+1. Unlike the usage routes this window
-            # filters whole periods rather than bounding a day range, and a capture
-            # of the portal's own SPA shows EndDate=<capture date> returning the
-            # in-progress cycle. Mirror the shape that is known to work.
-            today.strftime("%m/%d/%Y"),
-            self.company,
-        )
-        payload = await self._get_json(
-            f"{USAGE_API}/MyPowerUsage/BillPeriods",
-            "BillPeriods",
-            params=dict(zip(names, values)),
-        )
-        return _parse_bill_periods(payload), payload
-
     async def async_get_bill_periods(self) -> list[tuple[dt.date, dt.date]]:
         """Every bill cycle the portal knows about, oldest first, `end` EXCLUSIVE.
 
@@ -828,45 +805,50 @@ class GaPowerApi:
         driven and not calendar driven - a hardcoded "reset on the 28th" would have
         been wrong on 3 of the last 7 cycles, and wrong precisely at the boundary,
         which is the one place it changes which cycle an hour is charged to.
+
+        On parameter casing: a browser capture showed PascalCase here while the
+        sibling UsageGraphData route on the same host uses camelCase, and earlier
+        notes warned this route would answer a wrong casing with an empty result.
+        Probed live 2026-09-13 - BOTH casings return byte-identical data, so the
+        casing is not load-bearing and no fallback is needed. PascalCase is kept
+        only because it is what the portal itself sends.
         """
         today = dt.date.today()
-        periods, payload = await self._try_bill_periods(_BILL_PERIOD_PASCAL, today)
-        if periods:
+        params = dict(zip(_BILL_PERIOD_PARAMS, (
+            self.service_agreement,
+            self.service_point,
+            self.premise_id,
+            (today - dt.timedelta(days=BILL_PERIOD_LOOKBACK_DAYS)).strftime("%m/%d/%Y"),
+            # Deliberately today, not today+1. Unlike the usage routes this window
+            # filters whole periods rather than bounding a day range, and a capture
+            # of the portal's own SPA shows EndDate=<capture date> returning the
+            # in-progress cycle. Mirror the shape that is known to work.
+            today.strftime("%m/%d/%Y"),
+            self.company,
+        )))
+        payload = await self._get_json(
+            f"{USAGE_API}/MyPowerUsage/BillPeriods", "BillPeriods", params=params
+        )
+        periods = _parse_bill_periods(payload)
+        if not periods:
+            # Structure only - names, types and lengths, plus the API's own status
+            # and message. Fires only on a path that has already failed, so it is
+            # free in normal operation and worth keeping permanently: this is the
+            # line that identified the response shape in one run, after a version
+            # that logged only the top-level key names could not.
+            _LOGGER.warning(
+                "BillPeriods returned no usable periods. status=%s/%s message=%.160s "
+                "modelErrors=%.160s data=%.700s",
+                payload.get("status"), payload.get("statusCode"),
+                payload.get("message"), payload.get("modelErrors"),
+                _describe(payload.get("data")),
+            )
+        else:
             _LOGGER.debug(
                 "BillPeriods: %s cycles, most recent %s -> %s (end exclusive)",
                 len(periods), periods[-1][0], periods[-1][1],
             )
-            return periods
-
-        # This API's signature failure mode is answering a wrong parameter shape with
-        # an empty result rather than an error, and this host genuinely mixes the two
-        # conventions - BillPeriods was captured taking PascalCase while its sibling
-        # UsageGraphData takes camelCase. Trying the other one costs a single GET on
-        # a path that has already failed, and settles in-flight what would otherwise
-        # cost a deploy, a restart and another real login to find out.
-        alt, alt_payload = await self._try_bill_periods(_BILL_PERIOD_CAMEL, today)
-        if alt:
-            _LOGGER.warning(
-                "BillPeriods accepted camelCase parameters, not the PascalCase the "
-                "browser capture showed. Working, but worth correcting the default."
-            )
-            return alt
-
-        # Structure only - names, types and lengths, plus the API's own status and
-        # message. Fires only on a path that has already failed twice, so it is free
-        # in normal operation and permanent: last time this integration met an
-        # unfamiliar response shape, identifying it cost several deploy cycles.
-        _LOGGER.warning(
-            "BillPeriods returned no usable periods under either parameter casing. "
-            "pascal: status=%s/%s message=%.160s modelErrors=%.160s data=%.700s | "
-            "camel: status=%s/%s data=%.300s",
-            payload.get("status"), payload.get("statusCode"),
-            payload.get("message"), payload.get("modelErrors"),
-            _describe(payload.get("data")),
-            alt_payload.get("status"), alt_payload.get("statusCode"),
-            _describe(alt_payload.get("data")),
-        )
-        return []
+        return periods
 
     async def async_get_hourly(
         self, start: dt.date, last_day: dt.date
@@ -987,16 +969,11 @@ def _merge(parsed: dict[str, Any], acc: dict[dt.datetime, dict[str, float]]) -> 
 # its content - so match on meaning instead of on an exact schema. Every other route
 # on this host answers in camelCase even where it takes PascalCase parameters, and
 # the comparison below is case-folded so either works.
-# The two naming conventions this host mixes. Order matters only as a default:
-# a browser capture showed BillPeriods taking PascalCase, and the camelCase form is
-# the shape its sibling UsageGraphData uses on the same host.
-_BILL_PERIOD_PASCAL = (
+# What the portal itself sends. Verified live 2026-09-13 that the camelCase
+# spelling returns identical data, so this is convention, not a requirement.
+_BILL_PERIOD_PARAMS = (
     "ServiceAgreementId", "ServicePointId", "PremiseId",
     "StartDate", "EndDate", "OperatingCompany",
-)
-_BILL_PERIOD_CAMEL = (
-    "serviceAgreementId", "servicePointId", "premiseId",
-    "startDate", "endDate", "operatingCompany",
 )
 
 _PERIOD_START_KEYS = (
@@ -1024,6 +1001,29 @@ def _as_date(value: Any) -> dt.date | None:
             return dt.datetime.strptime(head, fmt).date()
         except ValueError:
             continue
+    return None
+
+
+# Separators seen between two dates packed into a single field. The live response
+# is the SPA's period dropdown, whose value reads
+# "08/28/2026 00:00:00;09/29/2026 00:00:00". A bare "-" is deliberately NOT here:
+# it would split 09-29-2026 down the middle. Only a spaced dash is a separator.
+_PERIOD_SPLIT = re.compile(r"\s*[;|]\s*|\s+-\s+|\s+to\s+", re.I)
+
+
+def _combined_dates(rec: dict[str, Any]) -> tuple[dt.date, dt.date] | None:
+    """Two dates packed into one field - the shape this API actually returns."""
+    for key in sorted(rec, key=str):
+        value = rec[key]
+        # A long string is prose or an id, not a date range; skip before splitting.
+        if not isinstance(value, str) or len(value) > 120:
+            continue
+        parts = [p for p in _PERIOD_SPLIT.split(value) if p.strip()]
+        if len(parts) != 2:
+            continue
+        start, end = _as_date(parts[0]), _as_date(parts[1])
+        if start and end and end > start:
+            return start, end
     return None
 
 
@@ -1082,6 +1082,12 @@ def _parse_bill_periods(payload: dict[str, Any]) -> list[tuple[dt.date, dt.date]
         # A zero- or negative-length period is a parse failure, not a short cycle.
         if start and end and end > start:
             pairs.append((start, end))
+            continue
+        # No separate start/end fields. The live response packs both ends into one
+        # string, so fall back to reading a range out of a single value.
+        combined = _combined_dates(rec)
+        if combined:
+            pairs.append(combined)
 
     pairs.sort()
     return _normalise_ends(pairs)
