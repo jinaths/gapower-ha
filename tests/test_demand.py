@@ -2,10 +2,11 @@
 
 Run:  python tests/test_demand.py      (exits non-zero on any failure)
 
-Covers the parts where being wrong is expensive and silent: the half-up rounding
-that decides a $12.44 step, the cycle boundary that decides which bill an hour is
-charged to, the response shapes this API has actually been seen to return, and
-that the failure diagnostic cannot print an account number.
+Covers the parts where being wrong is expensive and silent: the bill formula
+(checked against printed bills to the cent), decimal-kW demand, the gap-filled bill
+projection, the cycle boundary that decides which bill an hour is charged to, the
+response shapes this API has actually been seen to return, and that the failure
+diagnostic cannot print an account number.
 """
 from __future__ import annotations
 
@@ -25,6 +26,7 @@ hastub.install()
 sys.path.insert(0, os.path.join(os.path.dirname(_HERE), "custom_components"))
 
 from gapower import api as gapi  # noqa: E402
+from gapower import billing as gbill  # noqa: E402
 from gapower import coordinator as gcoord  # noqa: E402
 from gapower import sensor as gsensor  # noqa: E402
 
@@ -259,8 +261,39 @@ live_desc = gapi._describe(LIVE["data"])
 check("the live shape renders readably", "09/29/2026" in live_desc, True)
 check("...with the opaque key withheld", "a" * 21 in live_desc, False)
 
-# =========================================================== the rounding rule
-section("billed demand: half-up rounding is the whole business rule")
+# =========================================================== the bill formula
+section("billing: the formula reproduces the printed bills")
+# Jul 28 - Aug 28 2026: 31 days, 1,593 kWh (152 on-peak), Pk kW 4.774 -> $217.33.
+check("Jul-Aug 2026 printed bill, to the cent",
+      gbill.estimate_bill(31, 1593, 152, 4.774, gbill.FUEL_JUN_SEP), 217.33)
+# Jun 25 - Jul 28 prints 1,670 kWh but its on+off registers sum to 1,671
+# (155 + 1,516). Fed the 1,670 total it lands one cent under the $221.45 printed.
+check("Jun-Jul 2026, within a cent",
+      abs(gbill.estimate_bill(33, 1670, 155, 4.624, gbill.FUEL_JUN_SEP) - 221.45) <= 0.011, True)
+check("demand all-in: 4.62 kW", gbill.demand_all_in(4.62), 72.91)
+check("demand all-in: 0.1 kW", gbill.demand_all_in(0.1), 1.58)
+check("fuel: a September bill is summer", gbill.fuel_rate(D(2026, 9, 29)), gbill.FUEL_JUN_SEP)
+check("fuel: an October bill is winter", gbill.fuel_rate(D(2026, 10, 28)), gbill.FUEL_OCT_MAY)
+check("fuel: exclusive end on Oct 1 is still a September bill",
+      gbill.fuel_rate(D(2026, 10, 1)), gbill.FUEL_JUN_SEP)
+
+section("billing: on-peak hours")
+H = dt.datetime
+check("Wed 2 Sep 14:00 is on-peak", gbill.is_on_peak(H(2026, 9, 2, 14)), True)
+check("18:00 is the last on-peak hour", gbill.is_on_peak(H(2026, 9, 2, 18)), True)
+check("19:00 is off-peak", gbill.is_on_peak(H(2026, 9, 2, 19)), False)
+check("13:00 is off-peak", gbill.is_on_peak(H(2026, 9, 2, 13)), False)
+check("Saturday is off-peak", gbill.is_on_peak(H(2026, 9, 5, 15)), False)
+check("October is off-peak", gbill.is_on_peak(H(2026, 10, 1, 15)), False)
+check("Labor Day 2026 (Sep 7) is off-peak", gbill.is_on_peak(H(2026, 9, 7, 15)), False)
+check("Jul 4 2026 is a Saturday -> observed Fri Jul 3",
+      gbill.is_on_peak(H(2026, 7, 3, 15)), False)
+check("...and Thu Jul 2 is on-peak", gbill.is_on_peak(H(2026, 7, 2, 15)), True)
+check("Jul 4 2027 is a Sunday -> observed Mon Jul 5",
+      gbill.is_on_peak(H(2027, 7, 5, 15)), False)
+
+# =========================================================== decimal demand
+section("demand is billed in decimal kW - no rounding, no brackets")
 CY = (D(2026, 8, 28), D(2026, 9, 29))
 
 
@@ -272,13 +305,16 @@ def peak_only(kwh, when=dt.datetime(2026, 9, 2, 13)):
     return demand({when: {"kwh": kwh}})
 
 
-for kwh, want in ((4.49, 4), (4.50, 5), (4.499, 4), (5.50, 6), (5.49, 5),
-                  (2.0, 2), (0.2, 0), (0.5, 1), (3.49, 3), (3.5, 4)):
-    check(str(kwh) + " kWh bills as " + str(want) + " kW",
-          peak_only(kwh)["billed_demand"], want)
+for kwh in (4.49, 4.50, 2.0, 0.2, 6.9):
+    check(str(kwh) + " kWh bills as " + str(kwh) + " kW",
+          peak_only(kwh)["billed_demand"], kwh)
+check("4.49 -> 4.50 costs 12 cents, not a $12.44 step",
+      round(peak_only(4.50)["demand_charge"] - peak_only(4.49)["demand_charge"], 2), 0.12)
+check("no bracket keys survive", {"target_kwh", "shed_kwh", "lower_charge",
+      "next_bracket_kwh"} & set(peak_only(4.62)), set())
 
 # =========================================================== the hand-checked cycle
-section("the 08/28-09/29 cycle, hand-worked on 2026-09-09")
+section("the 08/28-09/29 cycle")
 hourly = {
     dt.datetime(2026, 9, 2, 13): {"kwh": 4.62, "cost": 0.26},   # the peak
     dt.datetime(2026, 9, 3, 19): {"kwh": 4.39},
@@ -290,17 +326,45 @@ hourly = {
 r = demand(hourly)
 check("peak kWh", r["cycle_peak"], 4.62)
 check("peak hour", r["cycle_peak_time"], dt.datetime(2026, 9, 2, 13, tzinfo=TZ))
-check("billed demand", r["billed_demand"], 5)
-check("demand charge", r["demand_charge"], 62.20)
+check("billed demand", r["billed_demand"], 4.62)
+check("demand charge (the bill's line)", r["demand_charge"], 57.47)
+check("demand charge all-in", r["demand_charge_all_in"], 72.91)
 check("cycle length", r["cycle_length"], 32)
 check("day of cycle", r["cycle_day"], 6)
 check("cycle start", r["cycle_start"], dt.datetime(2026, 8, 28, tzinfo=TZ))
 check("cycle end (exclusive)", r["cycle_end"], dt.datetime(2026, 9, 29, tzinfo=TZ))
-check("target ceiling to drop a bracket", r["target_kwh"], 4.49)
-check("kWh to shed", r["shed_kwh"], 0.13)
-check("charge one bracket down", r["lower_charge"], 49.76)
-check("saving from shedding", round(r["demand_charge"] - r["lower_charge"], 2), 12.44)
-check("next step up", r["next_bracket_kwh"], 5.50)
+check("data through the newest in-cycle hour", r["data_through"],
+      dt.datetime(2026, 9, 4, 19, tzinfo=TZ))
+# Sparse fixture: 6 real hours in the 188 from Aug 28 00:00 to Sep 4 19:00.
+check("every other hour counts as missing", r["missing_hours"], 188 - 6)
+check("recorded kWh", r["cycle_kwh"], 22.52)
+
+section("bill projection: fill the gaps, scale to the cycle, price it")
+# A flat 1.5 kWh every hour of a 32-day cycle, peak 1.5, no gaps: exactly the
+# formula on 1,152 kWh with the right on-peak split.
+flat = {}
+t = dt.datetime(2026, 8, 28)
+while t < dt.datetime(2026, 9, 29):
+    flat[t] = {"kwh": 1.5}
+    t += dt.timedelta(hours=1)
+onk = sum(v["kwh"] for k, v in flat.items() if gbill.is_on_peak(k))
+want = gbill.estimate_bill(32, 1152.0, onk, 1.5, gbill.FUEL_JUN_SEP)
+full = demand(flat, today=D(2026, 9, 29))
+check("complete cycle: no missing hours", full["missing_hours"], 0)
+check("complete cycle: projection is the formula", full["bill_projection"], want)
+# Knock out 100 hours as zeros: the fill restores them exactly (flat profile).
+holed = {k: ({"kwh": 0.0} if i % 7 == 0 and i < 700 else v)
+         for i, (k, v) in enumerate(sorted(flat.items()))}
+h = demand(holed, today=D(2026, 9, 29))
+check("zero hours are counted as missing", h["missing_hours"], 100)
+check("...and filled, so the projection does not drop", h["bill_projection"], want)
+# Half a cycle of data projects the whole cycle.
+half = {k: v for k, v in flat.items() if k < dt.datetime(2026, 9, 12)}
+half_on = sum(v["kwh"] for k, v in half.items() if gbill.is_on_peak(k))
+check("half a cycle projects the whole one",
+      demand(half, today=D(2026, 9, 12))["bill_projection"],
+      gbill.estimate_bill(32, 1152.0, half_on * 32 * 24 / len(half), 1.5,
+                          gbill.FUEL_JUN_SEP))
 
 # =========================================================== boundaries
 section("cycle boundaries: which bill an hour is charged to")
@@ -330,10 +394,8 @@ empty = demand({})
 check("no data -> cycle window still reported", empty["cycle_length"], 32)
 check("no data -> peak is None", empty["cycle_peak"], None)
 check("no data -> billed demand is None", empty["billed_demand"], None)
-check("no data -> no stale target", empty["target_kwh"], None)
-zero = peak_only(0.2)
-check("a sub-half-kWh peak bills as 0 kW", zero["billed_demand"], 0)
-check("...and offers no negative target", zero["target_kwh"], None)
+check("no data -> no stale projection", empty["bill_projection"], None)
+check("no data -> no missing-hours count", empty["missing_hours"], None)
 
 # =========================================================== cycle caching
 section("_async_current_cycle: cache, carry, and do not swallow a dead session")
@@ -405,17 +467,20 @@ check("a refresh that still does not cover today keeps the old cycle",
 # =========================================================== sensor wiring
 section("sensor descriptions")
 keys = [d.key for d in gsensor.SENSORS]
-for k in ("cycle_peak", "billed_demand", "demand_charge", "cycle_start"):
+for k in ("cycle_peak", "billed_demand", "demand_charge", "cycle_start",
+          "bill_projection", "missing_hours"):
     check(k + " is declared", k in keys, True)
 check("no duplicate keys", len(keys), len(set(keys)))
 check("every description has a translation",
       all(d.translation_key for d in gsensor.SENSORS), True)
 
 by_key = {d.key: d for d in gsensor.SENSORS}
-check("billed_demand reads the right field", by_key["billed_demand"].value_fn(r), 5)
+check("billed_demand reads the right field", by_key["billed_demand"].value_fn(r), 4.62)
 check("cycle_peak reads the right field", by_key["cycle_peak"].value_fn(r), 4.62)
 check("demand_charge reads the right field",
-      by_key["demand_charge"].value_fn(r), 62.20)
+      by_key["demand_charge"].value_fn(r), 57.47)
+check("demand_charge carries the all-in figure",
+      by_key["demand_charge"].attrs_fn(r), {"all_in": 72.91})
 check("cycle_start reads the right field",
       by_key["cycle_start"].value_fn(r), dt.datetime(2026, 8, 28, tzinfo=TZ))
 check("billed_demand is in kW",
@@ -424,9 +489,9 @@ check("cycle_peak is in kWh", by_key["cycle_peak"].native_unit_of_measurement, "
 
 attrs = by_key["billed_demand"].attrs_fn(r)
 check("the alert can read the peak off one entity", attrs["peak_kwh"], 4.62)
-check("...and the ceiling", attrs["target_kwh"], 4.49)
-check("...and what shedding saves",
-      round(attrs["charge"] - attrs["lower_charge"], 2), 12.44)
+check("...and what it costs all-in", attrs["charge_all_in"], 72.91)
+check("...and what each 0.1 kWh is worth", attrs["per_tenth_all_in"], 1.58)
+check("...and how trustworthy the data is", attrs["missing_hours"], 182)
 check("...and where it is in the cycle",
       (attrs["cycle_day"], attrs["cycle_length"]), (6, 32))
 check("no attribute is missing", [k for k, v in attrs.items() if v is None], [])

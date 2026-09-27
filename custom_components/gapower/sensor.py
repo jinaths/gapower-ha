@@ -25,6 +25,7 @@ from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
 from . import GaPowerConfigEntry
+from .billing import demand_all_in
 from .const import DOMAIN
 from .coordinator import GaPowerCoordinator
 
@@ -34,26 +35,26 @@ class GaPowerSensorDescription(SensorEntityDescription):
     """Describes a Georgia Power sensor."""
 
     value_fn: Callable[[dict[str, Any]], Any]
-    # Optional extra attributes. Used by billed_demand to carry the whole bracket
+    # Optional extra attributes. Used by billed_demand to carry the whole demand
     # picture on one entity, so an alert can be rendered from a single state object
-    # rather than joining four sensors that update at slightly different moments.
+    # rather than joining several sensors that update at slightly different moments.
     attrs_fn: Callable[[dict[str, Any]], dict[str, Any]] | None = None
 
 
 def _demand_attrs(d: dict[str, Any]) -> dict[str, Any]:
-    """Everything an alert needs about the current bracket, on one entity."""
+    """Everything an alert needs about the cycle's demand, on one entity."""
     return {
         "peak_kwh": d.get("cycle_peak"),
         "peak_time": d.get("cycle_peak_time"),
+        # The bill's "Demand" line, and what it costs once riders, franchise fee and
+        # sales tax are added. Billing is linear, so there is no bracket to aim for:
+        # every 0.1 kWh off the worst hour is worth the same (per_tenth_all_in).
         "charge": d.get("demand_charge"),
-        # Stay at or below target_kwh and the bill drops a whole bracket; shed_kwh is
-        # what that costs from the current peak. Expressed as a ceiling on purpose -
-        # the charge is a step function, so a percentage target is meaningless and
-        # can be satisfied while saving nothing.
-        "target_kwh": d.get("target_kwh"),
-        "shed_kwh": d.get("shed_kwh"),
-        "lower_charge": d.get("lower_charge"),
-        "next_bracket_kwh": d.get("next_bracket_kwh"),
+        "charge_all_in": d.get("demand_charge_all_in"),
+        "per_tenth_all_in": demand_all_in(0.1),
+        "bill_projection": d.get("bill_projection"),
+        "missing_hours": d.get("missing_hours"),
+        "data_through": d.get("data_through"),
         "cycle_start": d.get("cycle_start"),
         "cycle_end": d.get("cycle_end"),
         "cycle_day": d.get("cycle_day"),
@@ -97,9 +98,9 @@ SENSORS: tuple[GaPowerSensorDescription, ...] = (
     ),
     # --- demand charge -------------------------------------------------------
     # Georgia Power bills the single highest-usage hour of the whole cycle at
-    # $12.44/kW, rounded half-up. On a recent cycle that one hour was worth $62.20
-    # against $6.43 for all the on-peak energy put together, so these four are the
-    # expensive numbers on the bill, not the kWh totals.
+    # $12.44/kW, in decimal kW - no rounding. On a recent cycle that one hour was
+    # worth $57.47 ($72.91 all-in) against $6.43 for all the on-peak energy put
+    # together, so these are the expensive numbers on the bill, not the kWh totals.
     GaPowerSensorDescription(
         key="cycle_peak",
         translation_key="cycle_peak",
@@ -114,6 +115,7 @@ SENSORS: tuple[GaPowerSensorDescription, ...] = (
         device_class=SensorDeviceClass.POWER,
         native_unit_of_measurement=UnitOfPower.KILO_WATT,
         state_class=SensorStateClass.MEASUREMENT,
+        suggested_display_precision=2,
         value_fn=lambda d: d.get("billed_demand"),
         attrs_fn=_demand_attrs,
     ),
@@ -122,6 +124,31 @@ SENSORS: tuple[GaPowerSensorDescription, ...] = (
         translation_key="demand_charge",
         device_class=SensorDeviceClass.MONETARY,
         value_fn=lambda d: d.get("demand_charge"),
+        attrs_fn=lambda d: {"all_in": d.get("demand_charge_all_in")},
+    ),
+    # The whole bill for the current cycle, projected from the hours seen so far
+    # with the formula verified on printed bills. See coordinator._projection for
+    # why it fills the portal's missing hours before scaling.
+    GaPowerSensorDescription(
+        key="bill_projection",
+        translation_key="bill_projection",
+        device_class=SensorDeviceClass.MONETARY,
+        value_fn=lambda d: d.get("bill_projection"),
+        attrs_fn=lambda d: {
+            "cycle_kwh_recorded": d.get("cycle_kwh"),
+            "data_through": d.get("data_through"),
+        },
+    ),
+    # Hours this cycle the portal reported as 0 kWh or not at all. A house never
+    # draws zero for an hour; these are gaps in the utility's data, and they make
+    # every derived number here less certain.
+    GaPowerSensorDescription(
+        key="missing_hours",
+        translation_key="missing_hours",
+        entity_category=EntityCategory.DIAGNOSTIC,
+        state_class=SensorStateClass.MEASUREMENT,
+        native_unit_of_measurement="h",
+        value_fn=lambda d: d.get("missing_hours"),
     ),
     # Exposed so the window these are measured over is visible rather than implied -
     # it is meter-read driven, lands on day 25-28, and runs 29-32 days.

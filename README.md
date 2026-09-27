@@ -135,8 +135,10 @@ Your existing history is never lost, and the gap fills itself in once it's worki
 | **Latest hour cost** | Cost of that hour |
 | **Rows imported** | How many hours the last update wrote (diagnostic) |
 | **Cycle peak hour** | The worst single hour of the current billing cycle, in kWh |
-| **Billed demand** | That hour rounded half-up to whole kW — what a demand charge is billed on |
-| **Demand charge** | Billed demand x your demand rate |
+| **Billed demand** | That hour as kW (unrounded) — what a demand charge is billed on. An estimate: see below |
+| **Demand charge** | Billed demand x your demand rate; the `all_in` attribute adds riders, franchise fee and tax |
+| **Bill projection** | The whole current bill, projected from the hours seen so far (Georgia Power TOU-RD only) |
+| **Missing hours this cycle** | Hours the utility reported as 0 kWh or not at all — how far to trust the two above |
 | **Cycle start** | When the current billing cycle began (read from your account, not guessed) |
 
 **Status is the one to watch.** It's deliberately the only sensor that stays available when an
@@ -151,27 +153,37 @@ based on your **single highest-usage hour of the whole billing cycle** — separ
 energy charge, and not limited to peak hours. A big hour at 9pm on a Sunday costs exactly as much
 here as one at 3pm on a Tuesday.
 
-It is easy to underestimate. On one real cycle that single hour was worth **$62.20**, against
-**$6.43** for all the on-peak energy put together.
+It is easy to underestimate. On one real cycle that single hour was worth **$57.47** ($72.91 once
+riders, franchise fee and sales tax are added), against **$6.43** for all the on-peak energy put
+together.
 
-The last four sensors track it. Two things are worth knowing about how it behaves:
+The demand sensors track it. Three things are worth knowing about how it behaves:
 
-**It's a step, not a slope.** The kW is rounded half-up — 4.49 kWh bills as 4 kW, 4.50 bills as 5.
-So shaving 0.4 kWh off a 4.9 kWh hour saves nothing at all, while shaving 0.13 off a 4.62 hour saves
-a whole bracket. This is why `billed_demand` carries a **`target_kwh`** attribute: a ceiling to stay
-under is actionable, a percentage reduction is not.
+**It's a slope, not a step.** The kW is billed unrounded — printed bills show it to three decimals
+(4.624, 4.774), and every line of five real bills reproduces only with that figure. Every 0.1 kWh
+off the worst hour saves the same amount (`per_tenth_all_in`, about $1.58). An earlier version of
+this integration rounded half-up to whole kW; the bills disproved that.
+
+**It's an estimate.** The portal's hourly maximum has come in up to 0.4 kWh *above* the meter's
+billed figure, and the utility's hourly data has gaps: missing hours come back as 0 kWh, stay 0
+forever, and are missing from the portal's own spreadsheet download too. `missing_hours` counts
+them; `bill_projection` fills them with the cycle's average for that time-of-use period before
+projecting, which landed within about 3 % of two printed bills.
 
 **It's a running maximum.** Once the cycle's worst hour has happened, that cycle's charge is set and
 cannot come back down. The useful moment to act is *before* the spike, which makes this a
 scorekeeper and a feedback loop rather than a guardrail — change something, and a couple of days
 later it tells you whether the change worked.
 
-`billed_demand` also carries `peak_kwh`, `peak_time`, `charge`, `shed_kwh`, `lower_charge`,
-`next_bracket_kwh` and the cycle window, so an alert can be built from that one entity.
+`billed_demand` also carries `peak_kwh`, `peak_time`, `charge`, `charge_all_in`,
+`per_tenth_all_in`, `bill_projection`, `missing_hours`, `data_through` and the cycle window, so an
+alert can be built from that one entity.
 
-> **Check your own rate card.** The rate is set in `const.py` as `DEMAND_RATE` and defaults to
-> Georgia Power's Smart Usage figure. If your plan has no demand charge, or a different rate, these
-> four sensors will be wrong — the usage and cost data is unaffected either way.
+> **Check your own rate card.** The tariff is set in `const.py` (`DEMAND_RATE` and the rates
+> beside it) and defaults to Georgia Power's TOU-RD-12 ("Smart Usage") with its June 2026 riders,
+> inside city limits. If your plan has no demand charge, a different rate, or you live outside city
+> limits, the demand and projection sensors will be wrong — the usage and cost data that feeds the
+> Energy Dashboard is unaffected either way.
 
 The billing cycle is read from your account rather than assumed, because it is meter-read driven:
 across one real year the bills landed on days 25-28 of the month with cycles of 29-32 days, so any

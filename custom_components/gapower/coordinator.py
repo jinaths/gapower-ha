@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import datetime as dt
 import logging
-import math
 from typing import Any
 from zoneinfo import ZoneInfo
 
@@ -37,10 +36,10 @@ from .api import (
     GaPowerSessionExpired,
     GaPowerTransient,
 )
+from .billing import demand_all_in, estimate_bill, fuel_rate, is_on_peak
 from .const import (
     BACKFILL_DAYS,
     DEMAND_RATE,
-    DEMAND_ROUNDING,
     DOMAIN,
     REFETCH_DAYS,
     UPDATE_INTERVAL,
@@ -59,10 +58,11 @@ _DEMAND_KEYS = (
     "cycle_peak_time",
     "billed_demand",
     "demand_charge",
-    "target_kwh",
-    "shed_kwh",
-    "lower_charge",
-    "next_bracket_kwh",
+    "demand_charge_all_in",
+    "cycle_kwh",
+    "missing_hours",
+    "data_through",
+    "bill_projection",
 )
 
 # `mean_type` replaced `has_mean` in newer HA cores. Support both so the integration
@@ -75,6 +75,68 @@ try:
 except ImportError:  # pragma: no cover - older cores
     _MEAN_NONE = None
     _USE_MEAN_TYPE = False
+
+
+def _projection(
+    hourly: dict[dt.datetime, dict[str, float]],
+    start: dt.date,
+    end: dt.date,
+    peak_kwh: float,
+) -> dict[str, Any]:
+    """Project the whole cycle's bill from the hours seen so far.
+
+    The portal's hourly series is lossy: hours it never received come back as 0 kWh
+    (not the -1 placeholder), and they stay 0 through every refetch - its own CSV
+    download carries the same zeros. Summing it as-is ran 2-18 % under the billed
+    kWh in 2026. So:
+      1. count the hours from the cycle start to the newest reading that are zero
+         or absent (`missing_hours`, a data-quality signal in its own right);
+      2. fill each one with the cycle's mean for its own period (on/off-peak) -
+         this closed the gap to within ~2-5 % on five printed bills;
+      3. scale to the full cycle length and price it with the verified formula.
+    The result still reads a few percent low (some hours are under-recorded rather
+    than missing), and the peak can still rise before the cycle closes.
+    """
+    seen: dict[bool, list[float]] = {True: [], False: []}
+    last: dt.datetime | None = None
+    for ts, vals in hourly.items():
+        kwh = vals.get("kwh")
+        if kwh is None or not (start <= ts.date() < end):
+            continue
+        if last is None or ts > last:
+            last = ts
+        if kwh > 0:
+            seen[is_on_peak(ts)].append(kwh)
+    if last is None:
+        return {}
+
+    missing = {True: 0, False: 0}
+    ts = dt.datetime.combine(start, dt.time())
+    while ts <= last:
+        vals = hourly.get(ts)
+        if not vals or not vals.get("kwh"):
+            missing[is_on_peak(ts)] += 1
+        ts += dt.timedelta(hours=1)
+
+    overall = seen[True] + seen[False]
+    mean_all = sum(overall) / len(overall) if overall else 0.0
+    filled: dict[bool, float] = {}
+    for on in (True, False):
+        mean = sum(seen[on]) / len(seen[on]) if seen[on] else mean_all
+        filled[on] = sum(seen[on]) + missing[on] * mean
+
+    hours_seen = (last - dt.datetime.combine(start, dt.time())).total_seconds() / 3600 + 1
+    scale = (end - start).days * 24 / hours_seen
+    kwh_proj = (filled[True] + filled[False]) * scale
+    on_proj = filled[True] * scale
+    return {
+        "cycle_kwh": round(sum(overall), 2),
+        "missing_hours": missing[True] + missing[False],
+        "data_through": last,
+        "bill_projection": estimate_bill(
+            (end - start).days, kwh_proj, on_proj, peak_kwh, fuel_rate(end)
+        ),
+    }
 
 
 class GaPowerCoordinator(DataUpdateCoordinator[dict[str, Any]]):
@@ -282,21 +344,17 @@ class GaPowerCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         if peak_kwh is None or peak_ts is None:
             return out
 
-        billed = int(math.floor(peak_kwh + DEMAND_ROUNDING))
+        # Billed unrounded, in decimal kW (see DEMAND_RATE). This is still an ESTIMATE:
+        # the meter's own "Pk kW 1 Hour" has come in 0.13-0.39 below the portal's
+        # hourly maximum on three of five bills, and a missing hour can hide the peak.
         out["cycle_peak"] = round(peak_kwh, 3)
         out["cycle_peak_time"] = peak_ts.replace(tzinfo=tz)
-        out["billed_demand"] = billed
-        out["demand_charge"] = round(billed * DEMAND_RATE, 2)
-        # A step function has no useful slope, so express the advice as a ceiling:
-        # "keep every hour under 4.49" is actionable, "cut your peak 10%" may save
-        # nothing at all. target_kwh is the highest reading that still bills one
-        # bracket lower; shed_kwh is what that costs from the current peak.
-        if billed > 0:
-            target = round(billed - DEMAND_ROUNDING - 0.01, 2)
-            out["target_kwh"] = target
-            out["shed_kwh"] = round(peak_kwh - target, 2)
-            out["lower_charge"] = round((billed - 1) * DEMAND_RATE, 2)
-        out["next_bracket_kwh"] = round(billed + DEMAND_ROUNDING, 2)
+        out["billed_demand"] = round(peak_kwh, 2)
+        out["demand_charge"] = round(peak_kwh * DEMAND_RATE, 2)
+        out["demand_charge_all_in"] = demand_all_in(peak_kwh)
+        out.update(_projection(hourly, start, end, peak_kwh))
+        if out["data_through"] is not None:
+            out["data_through"] = out["data_through"].replace(tzinfo=tz)
         return out
 
     async def _async_import_statistics(self) -> dict[str, Any]:

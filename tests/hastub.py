@@ -69,6 +69,7 @@ class SensorEntityDescription:
     native_unit_of_measurement: str | None = None
     state_class: Any = None
     entity_category: Any = None
+    suggested_display_precision: int | None = None
 
 
 class _Entity:

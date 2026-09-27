@@ -50,6 +50,12 @@
       "demand_charge": {
         "name": "Demand charge"
       },
+      "bill_projection": {
+        "name": "Bill projection"
+      },
+      "missing_hours": {
+        "name": "Missing hours this cycle"
+      },
       "cycle_start": {
         "name": "Cycle start"
       },
